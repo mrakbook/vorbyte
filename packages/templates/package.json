@@ -1,0 +1,12 @@
+{
+  "name": "@vorbyte/templates",
+  "private": true,
+  "version": "0.1.0",
+  "description": "vorbyte.ai template gallery (metadata + overlays).",
+  "scripts": {
+    "lint": "node ./scripts/validate-templates.mjs",
+    "typecheck": "echo \"(templates) no TS to typecheck\"",
+    "test": "echo \"(templates) no tests yet\"",
+    "format": "prettier --write ."
+  }
+}

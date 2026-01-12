@@ -1,0 +1,9 @@
+{
+  "kitVersion": "0.1.0",
+  "stack": {
+    "framework": "nextjs",
+    "styling": "tailwind",
+    "ui": "shadcn"
+  },
+  "notes": "Copied into new projects as the base scaffold."
+}

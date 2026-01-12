@@ -1,0 +1,18 @@
+[
+  {
+    "id": "landing-page",
+    "name": "Landing Page",
+    "description": "Hero + features + CTA",
+    "thumbnail": "templates/landing-page/thumbnail.png",
+    "overlayDir": "templates/landing-page/overlay",
+    "tags": ["marketing", "simple"]
+  },
+  {
+    "id": "dashboard",
+    "name": "Dashboard",
+    "description": "Basic dashboard shell with sidebar + cards",
+    "thumbnail": "templates/dashboard/thumbnail.svg",
+    "overlayDir": "templates/dashboard/overlay",
+    "tags": ["app", "layout", "data"]
+  }
+]

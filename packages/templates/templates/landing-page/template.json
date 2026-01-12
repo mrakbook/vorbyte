@@ -1,0 +1,8 @@
+{
+  "id": "landing-page",
+  "name": "Landing Page",
+  "description": "A clean marketing landing page starter.",
+  "thumbnail": "thumbnail.png",
+  "overlayDir": "overlay",
+  "tags": ["marketing", "landing", "simple"]
+}
