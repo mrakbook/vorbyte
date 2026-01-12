@@ -529,6 +529,7 @@ export default function App() {
 
   const [mode, setMode] = useState<'chat' | 'design'>('chat')
   const [messages, setMessages] = useState<ChatMessage[]>([])
+  const [chatBusy, setChatBusy] = useState(false)
   const [draft, setDraft] = useState('')
 
   const [newProjectOpen, setNewProjectOpen] = useState(false)
@@ -559,17 +560,21 @@ export default function App() {
   }
 
   useEffect(() => {
-    void refreshAll()
-  }, [])
-
-  useEffect(() => {
     if (!activeProject) return
     ;(async () => {
       try {
         const nextTree = await window.api.fs.tree(activeProject.path, { maxDepth: 6 })
         setTree(nextTree)
-      } catch {
+      } catch (e) {
+        console.warn('Failed to load file tree', e)
         setTree(null)
+      }
+      try {
+        const nextChat = await window.api.chat.load(activeProject.path)
+        setMessages(nextChat)
+      } catch (e) {
+        console.warn('Failed to load chat history', e)
+        setMessages([])
       }
     })()
   }, [activeProject])
@@ -591,26 +596,51 @@ export default function App() {
     await openProject(created)
   }
 
-  function sendMessage() {
+  async function sendMessage() {
     const content = draft.trim()
     if (!content) return
+    if (!activeProject) return
+    if (chatBusy) return
 
     const userMsg: ChatMessage = {
-      id: uid(),
+      id: randomId(),
       role: 'user',
       content,
       createdAt: new Date().toISOString()
     }
 
-    const assistantMsg: ChatMessage = {
-      id: uid(),
+    const placeholderId = randomId()
+    const placeholder: ChatMessage = {
+      id: placeholderId,
       role: 'assistant',
-      content: `(AI response goes here...) You said: "${clampText(content, 140)}"`,
+      content: 'Generating…',
       createdAt: new Date().toISOString()
     }
 
-    setMessages((m) => [...m, userMsg, assistantMsg])
     setDraft('')
+    setChatBusy(true)
+    setMessages((prev) => [...prev, userMsg, placeholder])
+
+    try {
+      const result = await window.api.ai.run({ projectPath: activeProject.path, prompt: content })
+      setMessages(result.chat)
+      // Refresh file tree (the AI may have created/updated files)
+      const nextTree = await window.api.fs.tree(activeProject.path, { maxDepth: 6 })
+      setTree(nextTree)
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      setMessages((prev) => [
+        ...prev.filter((m) => m.id !== placeholderId),
+        {
+          id: randomId(),
+          role: 'assistant',
+          content: `⚠️ ${msg}`,
+          createdAt: new Date().toISOString()
+        }
+      ])
+    } finally {
+      setChatBusy(false)
+    }
   }
 
   function onChatKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
@@ -839,10 +869,15 @@ export default function App() {
                   />
                   <div className="mt-2 flex justify-end">
                     <button
-                      className="rounded bg-black px-4 py-2 text-sm text-white hover:bg-zinc-800"
+                      className={`rounded px-4 py-2 text-sm text-white ${
+                        chatBusy || !draft.trim()
+                          ? 'cursor-not-allowed bg-zinc-400'
+                          : 'bg-black hover:bg-zinc-800'
+                      }`}
                       onClick={sendMessage}
+                      disabled={chatBusy || !draft.trim()}
                     >
-                      Send
+                      {chatBusy ? 'Generating…' : 'Send'}
                     </button>
                   </div>
                 </div>

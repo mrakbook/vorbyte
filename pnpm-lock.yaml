@@ -94,11 +94,24 @@ importers:
         specifier: ^5.0.12
         version: 5.4.21(@types/node@18.19.130)(lightningcss@1.30.2)
 
-  packages/engine:
-    devDependencies:
+  packages/codegen:
+    dependencies:
       prettier:
         specifier: ^3.2.5
         version: 3.7.4
+    devDependencies:
+      '@types/node':
+        specifier: ^20.11.30
+        version: 20.19.28
+      typescript:
+        specifier: ^5.3.3
+        version: 5.9.3
+
+  packages/engine:
+    devDependencies:
+      '@types/node':
+        specifier: ^20.11.30
+        version: 20.19.28
       typescript:
         specifier: ^5.3.3
         version: 5.9.3
@@ -5190,7 +5203,7 @@ snapshots:
     dependencies:
       '@types/http-cache-semantics': 4.0.4
       '@types/keyv': 3.1.4
-      '@types/node': 18.19.130
+      '@types/node': 20.19.28
       '@types/responselike': 1.0.3
 
   '@types/debug@4.1.12':
@@ -5201,7 +5214,7 @@ snapshots:
 
   '@types/fs-extra@9.0.13':
     dependencies:
-      '@types/node': 18.19.130
+      '@types/node': 20.19.28
 
   '@types/http-cache-semantics@4.0.4': {}
 
@@ -5211,7 +5224,7 @@ snapshots:
 
   '@types/keyv@3.1.4':
     dependencies:
-      '@types/node': 18.19.130
+      '@types/node': 20.19.28
 
   '@types/ms@2.1.0': {}
 
@@ -5225,7 +5238,7 @@ snapshots:
 
   '@types/plist@3.0.5':
     dependencies:
-      '@types/node': 18.19.130
+      '@types/node': 20.19.28
       xmlbuilder: 15.1.1
     optional: true
 
@@ -5250,7 +5263,7 @@ snapshots:
 
   '@types/responselike@1.0.3':
     dependencies:
-      '@types/node': 18.19.130
+      '@types/node': 20.19.28
 
   '@types/semver@7.7.1': {}
 
@@ -5259,7 +5272,7 @@ snapshots:
 
   '@types/yauzl@2.10.3':
     dependencies:
-      '@types/node': 18.19.130
+      '@types/node': 20.19.28
     optional: true
 
   '@typescript-eslint/eslint-plugin@6.21.0(@typescript-eslint/parser@6.21.0(eslint@8.57.1)(typescript@5.9.3))(eslint@8.57.1)(typescript@5.9.3)':
