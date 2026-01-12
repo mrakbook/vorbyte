@@ -23,9 +23,26 @@ export interface TemplateSummary {
   thumbnail?: string
   /**
    * Path relative to templates root (example: "templates/landing-page/overlay")
-   * Used by the main process when copying template files.
    */
   overlayDir: string
+  tags?: string[]
+}
+
+export interface CreateProjectRequest {
+  name: string
+  /**
+   * Omit/undefined means "Start from scratch"
+   */
+  templateId?: string
+  aiMode?: AiMode
+  cloudModel?: string
+  /**
+   * For Milestone 1/2: can be a local model name ("llama3.1") or "ollama:llama3.1".
+   * (Later: can become a richer config object.)
+   */
+  localModel?: string
+  enableImageGeneration?: boolean
+  initGit?: boolean
 }
 
 export interface ProjectSummary {
@@ -35,33 +52,44 @@ export interface ProjectSummary {
   templateId?: string
 }
 
+export type FileTreeNodeType = 'file' | 'dir'
+
 export interface FileTreeNode {
-  name: string
   path: string
-  type: 'file' | 'dir'
+  name: string
+  type: FileTreeNodeType
   children?: FileTreeNode[]
 }
 
-export interface EnvVar {
+export interface EnvVarPair {
   key: string
   value: string
 }
 
 export interface AppSettings {
-  projectsRoot: string
-  openaiApiKey: string
-  localModelPath: string
-  envVars: EnvVar[]
-}
+  /**
+   * Folder where projects are created/listed.
+   */
+  projectsRoot?: string
 
-export interface CreateProjectRequest {
-  name: string
-  templateId: string
-  aiMode: AiMode
+  /**
+   * Stored for Milestone 1 persistence; secure storage can be added later.
+   */
+  openaiApiKey?: string
+
+  aiMode?: AiMode
   cloudModel?: string
-  localModel?: string
-  enableImageGeneration?: boolean
-  initGit?: boolean
+
+  /**
+   * For Milestone 1 UI: can be a local model path OR a model name (Ollama).
+   * Milestone 2 uses it as a model name by default.
+   */
+  localModelPath?: string
+
+  /**
+   * Simple env var UI storage.
+   */
+  envVars?: EnvVarPair[]
 }
 
 export interface SelectDirectoryOptions {
@@ -69,32 +97,33 @@ export interface SelectDirectoryOptions {
   defaultPath?: string
 }
 
-export type EngineProvider = 'ollama' | 'openai'
-
+/**
+ * Milestone 2: run a prompt through the AI engine and apply file changes into the project dir.
+ */
 export interface AiRunRequest {
-  requestId: string
   projectPath: string
-  provider: EngineProvider
-  model: string
-  messages: { role: 'system' | 'user' | 'assistant'; content: string }[]
+  prompt: string
   /**
-   * If true, stream partial output back to the UI.
-   * (In Milestone 2 we still return the final text; streaming is optional.)
+   * Optional id for cancellation.
    */
-  stream?: boolean
+  requestId?: string
 }
 
 export interface AiRunResult {
-  summary: string
-  writtenFiles: string[]
+  chat: ChatMessage[]
+  appliedFiles: string[]
   installedDependencies: string[]
-  raw: string
 }
 
 export interface VorByteApi {
   projects: {
     list: () => Promise<ProjectSummary[]>
     create: (req: CreateProjectRequest) => Promise<ProjectSummary>
+    /**
+     * Back-compat helper: some UI code expects the project file tree under projects.tree().
+     * Prefer fs.tree() for arbitrary folders.
+     */
+    tree: (projectPath: string, opts?: { maxDepth?: number }) => Promise<FileTreeNode>
   }
   templates: {
     list: () => Promise<TemplateSummary[]>
@@ -114,6 +143,11 @@ export interface VorByteApi {
   chat: {
     load: (projectPath: string) => Promise<ChatMessage[]>
     clear: (projectPath: string) => Promise<void>
+    /**
+     * Back-compat: older builds used chat.read/chat.write.
+     */
+    read: (projectPath: string) => Promise<ChatMessage[]>
+    write: (projectPath: string, chat: ChatMessage[]) => Promise<boolean>
   }
   ai: {
     run: (req: AiRunRequest) => Promise<AiRunResult>
@@ -132,6 +166,20 @@ export interface VorByteApi {
 export interface VorByteApiCompat {
   projectsList: () => Promise<ProjectSummary[]>
   projectsCreate: (req: CreateProjectRequest) => Promise<ProjectSummary>
+  /**
+   * Some UI code used window.api.projectsTree(projectPath).
+   */
+  projectsTree: (projectPath: string, opts?: { maxDepth?: number }) => Promise<FileTreeNode>
+
+  /**
+   * Some UI code used window.api.chatRead(projectPath).
+   */
+  chatRead: (projectPath: string) => Promise<ChatMessage[]>
+
+  /**
+   * Some UI code used window.api.chatWrite(projectPath, chat).
+   */
+  chatWrite: (projectPath: string, chat: ChatMessage[]) => Promise<boolean>
 }
 
 export type VorByteApiWithCompat = VorByteApi & VorByteApiCompat
