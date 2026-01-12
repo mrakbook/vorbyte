@@ -1,0 +1,18 @@
+{
+  "name": "@vorbyte/engine",
+  "version": "0.1.0",
+  "private": true,
+  "description": "VorByte AI engine (provider abstraction).",
+  "type": "module",
+  "main": "./src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "lint": "echo \"(engine) lint not set up yet\"",
+    "test": "echo \"(engine) no tests yet\"",
+    "format": "prettier --write ."
+  },
+  "devDependencies": {
+    "typescript": "^5.3.3",
+    "prettier": "^3.2.5"
+  }
+}
