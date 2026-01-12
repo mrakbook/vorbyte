@@ -1,8 +1,8 @@
-import type { VorByteApi } from '@shared/types'
+import type { VorByteApiWithCompat } from '../shared/types'
 
 declare global {
   interface Window {
-    api: VorByteApi
+    api: VorByteApiWithCompat
   }
 }
 

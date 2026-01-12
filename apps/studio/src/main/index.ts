@@ -1,195 +1,145 @@
 import { app, BrowserWindow, dialog, ipcMain } from 'electron'
-import path from 'path'
-import fs from 'fs/promises'
-import fssync from 'fs'
-import os from 'os'
-import crypto from 'crypto'
-
-import { electronApp, optimizer, is } from '@electron-toolkit/utils'
+import path from 'node:path'
+import os from 'node:os'
+import fs from 'node:fs/promises'
+import fssync from 'node:fs'
+import crypto from 'node:crypto'
 import dotenv from 'dotenv'
 
-import type {
-  AppSettings,
-  CreateProjectRequest,
-  ProjectSummary,
-  TemplateSummary,
-  FileTreeNode,
-  ChatMessage,
-  AiRunRequest,
-  AiRunResult
-} from '../shared/types'
+import type { AppSettings, CreateProjectRequest, FileTreeNode, ProjectSummary, TemplateSummary } from '../shared/types'
 
-// Milestone 2 modules (kept in packages/, imported as source to avoid build-order friction in dev)
-import { createAIEngine, type ChatMessage as EngineChatMessage } from '../../../../packages/engine/src/index'
-import { parseAiResponse, applyChanges } from '../../../../packages/codegen/src/index'
+// Milestone 2 packages (provider-agnostic engine + codegen)
+import { createAIEngine } from '../../../../packages/engine/src/createAIEngine'
+import type { ChatMessage as EngineChatMessage } from '../../../../packages/engine/src/types'
+import { parseAiResponse } from '../../../../packages/codegen/src/parse'
+import { applyChanges } from '../../../../packages/codegen/src/apply'
 
-/**
- * Load .env (in dev, this will pick up apps/studio/.env).
- */
 dotenv.config()
 
+// ---------------------------
+// Paths & constants
+// ---------------------------
+
+const SETTINGS_FILE = 'settings.json'
 const PROJECT_META_PATH = path.join('.vorbyte', 'project.json')
 const CHAT_HISTORY_PATH = path.join('.vorbyte', 'chat.json')
 
-const SETTINGS_PATH = path.join(app.getPath('userData'), 'settings.json')
+const SKIP_TREE_NAMES = new Set(['node_modules', '.git', '.next', 'dist', 'out'])
+const SKIP_COPY_NAMES = new Set(['node_modules', '.git', '.next', 'dist', 'out'])
 
-const SKIP_TREE_NAMES = new Set(['node_modules', '.next', '.git', '.vorbyte', 'dist', 'out'])
-const SKIP_COPY_NAMES = new Set(['node_modules', '.next', '.git', '.DS_Store', 'dist', 'out'])
+function expandHome(p: string): string {
+  if (p === '~') return os.homedir()
+  if (p.startsWith('~/')) return path.join(os.homedir(), p.slice(2))
+  return p
+}
 
-/**
- * AbortControllers for in-flight AI runs (for cancel button).
- */
-const aiRuns = new Map<string, AbortController>()
+function resolveFromCwd(p: string): string {
+  const expanded = expandHome(p)
+  return path.isAbsolute(expanded) ? expanded : path.resolve(process.cwd(), expanded)
+}
 
-function firstEnv(names: string[]): string | undefined {
-  for (const n of names) {
-    const v = process.env[n]
-    if (v && v.trim()) return v.trim()
-  }
-  return undefined
+function envPath(name: string): string | null {
+  const raw = process.env[name]
+  if (!raw) return null
+  return resolveFromCwd(raw)
 }
 
 function findRepoRoot(startDir: string): string {
-  let dir = startDir
-  for (let i = 0; i < 8; i++) {
+  let cur = startDir
+  for (;;) {
     if (
-      fssync.existsSync(path.join(dir, 'pnpm-workspace.yaml')) ||
-      fssync.existsSync(path.join(dir, 'turbo.json')) ||
-      fssync.existsSync(path.join(dir, '.git'))
+      fssync.existsSync(path.join(cur, 'pnpm-workspace.yaml')) ||
+      fssync.existsSync(path.join(cur, 'turbo.json')) ||
+      fssync.existsSync(path.join(cur, '.git'))
     ) {
-      return dir
+      return cur
     }
-    const parent = path.dirname(dir)
-    if (parent === dir) break
-    dir = parent
+    const parent = path.dirname(cur)
+    if (parent === cur) return startDir
+    cur = parent
   }
-  return startDir
 }
 
 const REPO_ROOT = findRepoRoot(process.cwd())
 
-function resolvePathSmart(p: string): string[] {
-  if (!p) return []
-  if (path.isAbsolute(p)) return [p]
-
-  // Try a few common bases:
-  // - package cwd (apps/studio)
-  // - repo root
-  // - one and two levels above cwd (often where pnpm/turbo is executed from)
-  const bases = [process.cwd(), path.resolve(process.cwd(), '..'), path.resolve(process.cwd(), '../..'), REPO_ROOT]
-  const out: string[] = []
-  for (const base of bases) {
-    out.push(path.resolve(base, p))
-  }
-  return out
-}
-
-function envPathAny(names: string[]): string | undefined {
-  const v = firstEnv(names)
-  if (!v) return undefined
-  const candidates = resolvePathSmart(v)
-  for (const c of candidates) {
-    if (fssync.existsSync(c)) return c
-  }
-  return undefined
-}
-
-
-function defaultProjectsRoot(): string {
-  // Prefer explicit env if provided
-  const p = envPathAny(['VORBYTE_PROJECTS_ROOT', 'vorbyte_PROJECTS_ROOT', 'LOCALFORGE_PROJECTS_ROOT'])
-  if (p) return p
-  return path.join(os.homedir(), 'VorByteProjects')
-}
-
 function templatesRoot(): string {
-  return (
-    envPathAny(['VORBYTE_TEMPLATES_PATH', 'vorbyte_TEMPLATES_PATH', 'LOCALFORGE_TEMPLATES_PATH']) ??
-    path.resolve(REPO_ROOT, 'packages/templates')
-  )
+  return envPath('VORBYTE_TEMPLATES_PATH') ?? path.resolve(REPO_ROOT, 'packages/templates')
 }
 
 function templateKitRoot(): string {
-  return (
-    envPathAny(['VORBYTE_TEMPLATE_KIT_PATH', 'vorbyte_TEMPLATE_KIT_PATH', 'LOCALFORGE_TEMPLATE_KIT_PATH']) ??
-    path.resolve(REPO_ROOT, 'packages/template-kit')
-  )
+  return envPath('VORBYTE_TEMPLATE_KIT_PATH') ?? path.resolve(REPO_ROOT, 'packages/template-kit')
 }
 
-async function ensureDir(dir: string) {
-  await fs.mkdir(dir, { recursive: true })
+async function ensureDir(p: string) {
+  await fs.mkdir(p, { recursive: true })
 }
 
-async function readJson<T>(filePath: string): Promise<T | null> {
+function sanitizeFolderName(name: string): string {
+  const trimmed = (name ?? '').trim()
+  const base = trimmed.length ? trimmed : 'Untitled'
+  // Prevent path traversal / separators & keep it reasonably filesystem-friendly
+  return base
+    .replace(/[\\/\0]/g, '-') // path separators and NUL
+    .replace(/[:*?"<>|]/g, '-') // Windows-illegal chars (also safe on macOS)
+    .trim()
+    .slice(0, 80)
+}
+
+async function readJson<T>(filePath: string, fallback: T): Promise<T> {
   try {
-    const raw = await fs.readFile(filePath, 'utf-8')
-    return JSON.parse(raw) as T
+    const txt = await fs.readFile(filePath, 'utf-8')
+    return JSON.parse(txt) as T
   } catch {
-    return null
+    return fallback
   }
 }
 
-async function writeJsonAtomic(filePath: string, data: unknown) {
+async function writeJsonAtomic(filePath: string, data: unknown): Promise<void> {
   await ensureDir(path.dirname(filePath))
-  const tmp = `${filePath}.${Date.now()}.tmp`
+  const tmp = `${filePath}.tmp`
   await fs.writeFile(tmp, JSON.stringify(data, null, 2), 'utf-8')
   await fs.rename(tmp, filePath)
 }
 
-async function loadSettings(): Promise<AppSettings> {
-  const existing = await readJson<AppSettings>(SETTINGS_PATH)
-  if (existing) {
-    // Normalize envVars to an array (older builds stored Record<string,string>)
-    const anySettings = existing as any
-    if (anySettings.envVars && !Array.isArray(anySettings.envVars)) {
-      const pairs = Object.entries(anySettings.envVars).map(([key, value]) => ({
-        key,
-        value: String(value)
-      }))
-      anySettings.envVars = pairs
-    }
-    return anySettings
-  }
+function defaultProjectsRoot(): string {
+  const envRoot = envPath('VORBYTE_PROJECTS_ROOT')
+  return envRoot ?? path.join(os.homedir(), 'VorByteProjects')
+}
 
-  const defaults: AppSettings = {
+function defaultSettings(): AppSettings {
+  return {
     projectsRoot: defaultProjectsRoot(),
     openaiApiKey: '',
-    aiMode: 'cloud',
-    cloudModel: 'gpt-4o-mini',
-    localModelPath: 'ollama:llama3.1',
+    localModelPath: '',
     envVars: []
   }
+}
 
-  await writeJsonAtomic(SETTINGS_PATH, defaults)
-  return defaults
+function settingsPath(): string {
+  return path.join(app.getPath('userData'), SETTINGS_FILE)
+}
+
+async function loadSettings(): Promise<AppSettings> {
+  return readJson<AppSettings>(settingsPath(), defaultSettings())
 }
 
 async function saveSettings(next: AppSettings): Promise<AppSettings> {
-  const current = await loadSettings()
-  const merged: AppSettings = {
-    ...current,
-    ...next,
-    envVars: Array.isArray(next.envVars) ? next.envVars : current.envVars
-  }
-  await writeJsonAtomic(SETTINGS_PATH, merged)
-  return merged
+  await writeJsonAtomic(settingsPath(), next)
+  return next
 }
+
+// ---------------------------
+// Templates
+// ---------------------------
 
 async function loadTemplatesIndex(): Promise<TemplateSummary[]> {
   const root = templatesRoot()
   const indexPath = path.join(root, 'templates.index.json')
-  const data = await readJson<any>(indexPath)
-
-  // Support both formats:
-  // 1) Array of templates: [ { id, name, ... } ]
-  // 2) Wrapped object: { templates: [ ... ] }
-  if (Array.isArray(data)) return data as TemplateSummary[]
-  if (data && Array.isArray(data.templates)) return data.templates as TemplateSummary[]
-
-  return []
+  return readJson<TemplateSummary[]>(indexPath, [])
 }
 
 async function templateThumbnailData(templateId: string): Promise<string | null> {
+  if (templateId === 'scratch') return null
   const root = templatesRoot()
   const templates = await loadTemplatesIndex()
   const t = templates.find((x) => x.id === templateId)
@@ -213,39 +163,47 @@ async function templateThumbnailData(templateId: string): Promise<string | null>
   }
 }
 
+// ---------------------------
+// Project list & creation
+// ---------------------------
+
+async function readProjectMeta(projectPath: string): Promise<any | null> {
+  const metaPath = path.join(projectPath, PROJECT_META_PATH)
+  return readJson<any | null>(metaPath, null)
+}
+
 async function listProjects(): Promise<ProjectSummary[]> {
   const settings = await loadSettings()
   const root = settings.projectsRoot || defaultProjectsRoot()
   await ensureDir(root)
 
-  const dirs = await fs.readdir(root, { withFileTypes: true })
-  const out: ProjectSummary[] = []
+  const entries = await fs.readdir(root, { withFileTypes: true })
+  const dirs = entries.filter((e) => e.isDirectory()).map((e) => e.name)
 
-  for (const d of dirs) {
-    if (!d.isDirectory()) continue
-    const projectPath = path.join(root, d.name)
-    const metaPath = path.join(projectPath, PROJECT_META_PATH)
-    const meta = await readJson<any>(metaPath)
-    out.push({
-      name: meta?.name ?? d.name,
+  const results: ProjectSummary[] = []
+  for (const dirName of dirs) {
+    const projectPath = path.join(root, dirName)
+    const meta = await readProjectMeta(projectPath)
+    results.push({
+      name: meta?.name ?? dirName,
       path: projectPath,
       createdAt: meta?.createdAt,
       templateId: meta?.templateId
     })
   }
 
-  // newest first when createdAt is available
-  out.sort((a, b) => (b.createdAt ?? '').localeCompare(a.createdAt ?? ''))
-  return out
+  results.sort((a, b) => (b.createdAt ?? '').localeCompare(a.createdAt ?? ''))
+  return results
 }
 
-async function copyDir(src: string, dest: string) {
-  await ensureDir(dest)
+async function copyDir(src: string, dest: string): Promise<void> {
   await fs.cp(src, dest, {
     recursive: true,
-    filter: (p) => {
-      const base = path.basename(p)
-      return !SKIP_COPY_NAMES.has(base)
+    force: true,
+    filter: (srcPath) => {
+      const base = path.basename(srcPath)
+      if (SKIP_COPY_NAMES.has(base)) return false
+      return true
     }
   })
 }
@@ -255,43 +213,51 @@ async function createProject(req: CreateProjectRequest): Promise<ProjectSummary>
   const projectsRoot = settings.projectsRoot || defaultProjectsRoot()
   await ensureDir(projectsRoot)
 
-  const name = (req.name || 'Untitled').trim()
-  const projectPath = path.join(projectsRoot, name)
+  const displayName = (req.name || 'Untitled').trim() || 'Untitled'
+  const folderBase = sanitizeFolderName(displayName)
 
-  if (fssync.existsSync(projectPath)) {
-    throw new Error(`Project folder already exists: ${projectPath}`)
+  // Ensure a unique folder (avoid hard error if a user repeats a name)
+  let projectPath = path.join(projectsRoot, folderBase)
+  let n = 2
+  while (fssync.existsSync(projectPath)) {
+    projectPath = path.join(projectsRoot, `${folderBase}-${n}`)
+    n += 1
   }
 
   // 1) Copy template kit scaffold
   const kitPath = templateKitRoot()
   if (!fssync.existsSync(kitPath)) {
     throw new Error(
-      `Template kit not found at ${kitPath}. Set VORBYTE_TEMPLATE_KIT_PATH (or vorbyte_TEMPLATE_KIT_PATH) to the kit folder.`
+      `Template kit not found at: ${kitPath}. Ensure packages/template-kit exists, or set VORBYTE_TEMPLATE_KIT_PATH.`
     )
   }
   await copyDir(kitPath, projectPath)
 
   // 2) Apply template overlay (optional)
-  const templateId = req.templateId
-  if (templateId) {
+  const templateId = (req.templateId ?? 'scratch').trim() || 'scratch'
+  if (templateId !== 'scratch') {
+    const templatesRootAbs = templatesRoot()
     const templates = await loadTemplatesIndex()
-    const tmpl = templates.find((t) => t.id === templateId)
-    if (!tmpl) throw new Error(`Template not found: ${templateId}`)
-    const overlayPath = path.isAbsolute(tmpl.overlayDir) ? tmpl.overlayDir : path.join(templatesRoot(), tmpl.overlayDir)
-    if (!fssync.existsSync(overlayPath)) throw new Error(`Overlay folder missing: ${overlayPath}`)
+    const t = templates.find((x) => x.id === templateId)
+    if (!t) throw new Error(`Template not found: ${templateId}`)
+
+    const overlayPath = path.isAbsolute(t.overlayDir) ? t.overlayDir : path.join(templatesRootAbs, t.overlayDir)
+    if (!fssync.existsSync(overlayPath)) {
+      throw new Error(`Overlay directory not found for template '${templateId}': ${overlayPath}`)
+    }
     await copyDir(overlayPath, projectPath)
   }
 
-  // 3) Write VorByte project metadata
+  // 3) Write project metadata
   const createdAt = new Date().toISOString()
   const meta = {
-    name,
+    name: displayName,
     createdAt,
-    templateId: templateId ?? null,
+    templateId,
     ai: {
-      aiMode: req.aiMode ?? settings.aiMode ?? 'local',
-      cloudModel: req.cloudModel ?? settings.cloudModel ?? null,
-      localModel: req.localModel ?? settings.localModelPath ?? null,
+      aiMode: req.aiMode,
+      cloudModel: req.cloudModel ?? null,
+      localModel: req.localModel ?? null,
       enableImageGeneration: !!req.enableImageGeneration
     },
     initGit: !!req.initGit
@@ -310,240 +276,166 @@ async function createProject(req: CreateProjectRequest): Promise<ProjectSummary>
     // You can add: spawn('git', ['init'], { cwd: projectPath }) in Milestone 3/4.
   }
 
-  return { name, path: projectPath, createdAt, templateId }
+  return { name: displayName, path: projectPath, createdAt, templateId }
 }
+
+// ---------------------------
+// File tree
+// ---------------------------
 
 async function buildTree(rootPath: string, maxDepth = 5, depth = 0): Promise<FileTreeNode> {
   const name = path.basename(rootPath)
-  const node: FileTreeNode = { path: rootPath, name, type: 'dir', children: [] }
+  const stat = await fs.stat(rootPath)
+
+  if (!stat.isDirectory()) {
+    return { name, path: rootPath, type: 'file' }
+  }
+
+  const node: FileTreeNode = { name, path: rootPath, type: 'dir', children: [] }
   if (depth >= maxDepth) return node
 
   const entries = await fs.readdir(rootPath, { withFileTypes: true })
-  for (const e of entries) {
-    if (SKIP_TREE_NAMES.has(e.name)) continue
-    const p = path.join(rootPath, e.name)
+  const filtered = entries
+    .filter((e) => !SKIP_TREE_NAMES.has(e.name))
+    .sort((a, b) => Number(b.isDirectory()) - Number(a.isDirectory()) || a.name.localeCompare(b.name))
+
+  for (const e of filtered) {
+    const childPath = path.join(rootPath, e.name)
     if (e.isDirectory()) {
-      node.children!.push(await buildTree(p, maxDepth, depth + 1))
+      node.children!.push(await buildTree(childPath, maxDepth, depth + 1))
     } else {
-      node.children!.push({ path: p, name: e.name, type: 'file' })
+      node.children!.push({ name: e.name, path: childPath, type: 'file' })
     }
   }
-
-  node.children!.sort((a, b) => {
-    if (a.type !== b.type) return a.type === 'dir' ? -1 : 1
-    return a.name.localeCompare(b.name)
-  })
 
   return node
 }
 
-function toEngineMessages(chat: ChatMessage[]): EngineChatMessage[] {
-  return chat.map((m) => ({ role: m.role, content: m.content }))
+// ---------------------------
+// Chat persistence (Milestone 2)
+// ---------------------------
+
+async function loadChat(projectPath: string) {
+  const filePath = path.join(projectPath, CHAT_HISTORY_PATH)
+  return readJson<any[]>(filePath, [])
 }
 
-async function loadChat(projectPath: string): Promise<ChatMessage[]> {
-  const chatPath = path.join(projectPath, CHAT_HISTORY_PATH)
-  const data = await readJson<ChatMessage[]>(chatPath)
-  return Array.isArray(data) ? data : []
+async function saveChat(projectPath: string, messages: any[]) {
+  const filePath = path.join(projectPath, CHAT_HISTORY_PATH)
+  await writeJsonAtomic(filePath, messages)
 }
 
-async function saveChat(projectPath: string, chat: ChatMessage[]) {
-  const chatPath = path.join(projectPath, CHAT_HISTORY_PATH)
-  await writeJsonAtomic(chatPath, chat)
+// ---------------------------
+// AI run orchestration (Milestone 2)
+// ---------------------------
+
+const running = new Map<string, AbortController>()
+
+function makeId(): string {
+  return crypto.randomBytes(8).toString('hex')
 }
 
 function buildSystemPrompt(): string {
   return [
-    'You are VorByte, an expert Next.js (App Router) + Tailwind + shadcn/ui developer.',
+    'You are an expert Next.js + Tailwind developer.',
+    'Generate or modify code for the project.',
     '',
-    'Your job is to generate or modify code in the user\'s Next.js project.',
+    'Output format:',
+    '- Start with a short summary (1-6 lines) describing what you changed.',
+    '- Then emit one or more file blocks using either of these formats:',
+    '  1) File: path/to/file.ext',
+    '     ```',
+    '     <full file content>',
+    '     ```',
+    '  2) ```file path/to/file.ext',
+    '     <full file content>',
+    '     ```',
     '',
-    'Hard requirements:',
-    '- Use Next.js App Router conventions (app/ directory).',
-    '- Use Tailwind for styling.',
-    '- Prefer functional React components.',
-    '- Output MUST be parseable by the app.',
+    'Also list dependencies if you add new packages:',
+    'Dependencies: ["some-pkg", "@scope/other-pkg"]',
     '',
-    'Output format (VERY IMPORTANT):',
-    '1) Start with a short plain-English summary (what you changed).',
-    '2) Then, for every file you want to create or change, output:',
-    '',
-    'File: relative/path/from/project/root',
-    '```tsx',
-    '...full file content...',
-    '```',
-    '',
-    '3) If you introduce new npm dependencies, add a line:',
-    'Dependencies: ["package-a","package-b"]',
-    '',
-    'Rules:',
-    '- Always provide FULL file contents (not diffs).',
-    '- Use relative paths only. Do NOT use absolute paths.',
-    '- Do NOT include prose inside code fences.',
-    '- If no files need changing, output only the summary and no File blocks.'
+    'Constraints:',
+    '- Use Next.js + Tailwind CSS and shadcn/ui where appropriate.',
+    '- Prefer full file outputs (not diffs).',
+    '- Never write outside the project directory.'
   ].join('\n')
 }
 
-async function buildFileTreeContext(projectPath: string): Promise<string> {
-  // Provide a lightweight file list so the model can pick correct paths.
-  const maxFiles = 250
-  const out: string[] = []
-
-  async function walk(dir: string, prefix: string) {
-    const entries = await fs.readdir(dir, { withFileTypes: true })
-    for (const e of entries) {
-      if (SKIP_TREE_NAMES.has(e.name)) continue
-      const abs = path.join(dir, e.name)
-      const rel = path.posix.join(prefix, e.name)
-      if (out.length >= maxFiles) return
-      if (e.isDirectory()) {
-        out.push(rel + '/')
-        await walk(abs, rel)
-      } else {
-        out.push(rel)
-      }
-      if (out.length >= maxFiles) return
-    }
-  }
-
-  await walk(projectPath, '')
-  return `Project file tree (partial):\n${out.map((p) => `- ${p}`).join('\n')}`
+function toEngineMessages(input: { role: string; content: string }[]): EngineChatMessage[] {
+  return input.map((m) => ({
+    role: m.role as any,
+    content: m.content
+  }))
 }
 
-function parseLocalModel(raw: string | undefined): { provider: 'ollama'; model: string } {
-  const fallback = { provider: 'ollama' as const, model: 'llama3.1' }
-  if (!raw) return fallback
-  const v = raw.trim()
-  if (!v) return fallback
-  const parts = v.split(':')
-  if (parts.length >= 2) {
-    const provider = parts[0].trim().toLowerCase()
-    const model = parts.slice(1).join(':').trim()
-    if (provider === 'ollama' && model) return { provider: 'ollama', model }
-  }
-  // If no provider prefix, assume ollama model name
-  return { provider: 'ollama', model: v }
-}
+async function runAiAndApply(opts: {
+  requestId?: string
+  projectPath: string
+  provider: 'ollama' | 'openai'
+  model: string
+  messages: { role: 'system' | 'user' | 'assistant'; content: string }[]
+}): Promise<{ summary: string; writtenFiles: string[]; installedDependencies: string[]; raw: string }> {
+  const requestId = opts.requestId || makeId()
 
-async function runAiAndApply(req: AiRunRequest): Promise<AiRunResult> {
-  const settings = await loadSettings()
-  const projectPath = req.projectPath
+  // Cancel any prior request with same id
+  const prev = running.get(requestId)
+  if (prev) prev.abort()
 
-  // Basic existence check
-  if (!fssync.existsSync(projectPath)) {
-    throw new Error(`Project path not found: ${projectPath}`)
-  }
-
-  const metaPath = path.join(projectPath, PROJECT_META_PATH)
-  const meta = (await readJson<any>(metaPath)) ?? {}
-
-  const aiMode: 'local' | 'cloud' = meta?.ai?.aiMode ?? settings.aiMode ?? 'local'
-  const cloudModel = meta?.ai?.cloudModel ?? settings.cloudModel ?? 'gpt-4o-mini'
-  const localModelRaw = meta?.ai?.localModel ?? settings.localModelPath ?? 'ollama:llama3.1'
-
-  const requestId = req.requestId || crypto.randomUUID()
-  const ac = new AbortController()
-  aiRuns.set(requestId, ac)
-
-  // Basic timeout guard (prevents hung requests)
-  const timeoutMs = 3 * 60 * 1000
-  const timeout = setTimeout(() => ac.abort(), timeoutMs)
+  const controller = new AbortController()
+  running.set(requestId, controller)
 
   try {
-    const systemPrompt = buildSystemPrompt()
-    const treeContext = await buildFileTreeContext(projectPath)
+    const settings = await loadSettings()
 
-    const chat = await loadChat(projectPath)
-    const userMsg: ChatMessage = {
-      id: crypto.randomUUID(),
-      role: 'user',
-      content: req.prompt,
-      createdAt: new Date().toISOString()
-    }
-
-    const nextChat = [...chat, userMsg]
-
-    // Build provider engine
     const engine =
-      aiMode === 'cloud'
-        ? (() => {
-            const baseUrl = firstEnv(['VORBYTE_OPENAI_BASE_URL', 'vorbyte_OPENAI_BASE_URL'])
-            const apiKey = settings.openaiApiKey?.trim() ?? ''
-            const isLocalBaseUrl = !!baseUrl && /(localhost|127\.0\.0\.1)/.test(baseUrl)
-            if (!apiKey && !isLocalBaseUrl) {
-              throw new Error('OpenAI API key is missing. Set it in Settings (Cloud mode).')
+      opts.provider === 'openai'
+        ? createAIEngine({
+            provider: 'openai',
+            openai: {
+              apiKey: settings.openaiApiKey,
+              model: opts.model
             }
-            return createAIEngine({
-              provider: 'openai',
-              openai: { apiKey: apiKey || 'local', model: cloudModel, baseUrl, temperature: 0.2 }
-            })
-          })()
-        : (() => {
-            const { model } = parseLocalModel(localModelRaw)
-            const baseUrl = firstEnv(['VORBYTE_OLLAMA_BASE_URL', 'vorbyte_OLLAMA_BASE_URL']) ?? 'http://localhost:11434'
-            return createAIEngine({
-              provider: 'ollama',
-              ollama: { baseUrl, model, temperature: 0.2 }
-            })
-          })()
+          })
+        : createAIEngine({
+            provider: 'ollama',
+            ollama: {
+              baseUrl: process.env.OLLAMA_BASE_URL ?? 'http://localhost:11434',
+              model: opts.model
+            }
+          })
 
-    const messages: EngineChatMessage[] = [
-      { role: 'system', content: systemPrompt },
-      { role: 'system', content: treeContext },
-      ...toEngineMessages(nextChat)
-    ]
+    const system = buildSystemPrompt()
 
-    const { text } = await engine.chat({ messages, signal: ac.signal, stream: false })
+    const merged: EngineChatMessage[] = [{ role: 'system', content: system }, ...toEngineMessages(opts.messages)]
 
-    // Parse code blocks + deps
+    const { text } = await engine.chat({ messages: merged, signal: controller.signal })
+
     const parsed = parseAiResponse(text)
 
-    // Apply changes to filesystem
-    const applyRes = await applyChanges({
-      projectDir: projectPath,
+    const applied = await applyChanges({
+      projectDir: opts.projectPath,
       files: parsed.files,
       dependencies: parsed.dependencies
     })
 
-    const summary = parsed.summary || 'Done.'
-    const parts: string[] = [summary]
-
-    if (applyRes.writtenFiles.length > 0) {
-      parts.push('', '✅ Updated files:', ...applyRes.writtenFiles.map((f) => `- ${f}`))
-    }
-    if (applyRes.installedDependencies.length > 0) {
-      parts.push('', '📦 Installed dependencies:', ...applyRes.installedDependencies.map((d) => `- ${d}`))
-    }
-    if (parsed.files.length === 0) {
-      parts.push('', '_No file blocks were returned by the model._')
-    }
-
-    const assistantMsg: ChatMessage = {
-      id: crypto.randomUUID(),
-      role: 'assistant',
-      content: parts.join('\n'),
-      createdAt: new Date().toISOString()
-    }
-
-    const finalChat = [...nextChat, assistantMsg]
-    await saveChat(projectPath, finalChat)
-
     return {
-      chat: finalChat,
-      appliedFiles: applyRes.writtenFiles,
-      installedDependencies: applyRes.installedDependencies
+      summary: parsed.summary || 'Applied changes.',
+      writtenFiles: applied.writtenFiles,
+      installedDependencies: applied.installedDependencies,
+      raw: text
     }
   } finally {
-    clearTimeout(timeout)
-    aiRuns.delete(requestId)
+    running.delete(requestId)
   }
 }
 
-let mainWindow: BrowserWindow | null = null
+// ---------------------------
+// Electron window
+// ---------------------------
 
 function createWindow(): void {
-  mainWindow = new BrowserWindow({
-    width: 1280,
+  const mainWindow = new BrowserWindow({
+    width: 1200,
     height: 800,
     show: false,
     autoHideMenuBar: true,
@@ -553,79 +445,87 @@ function createWindow(): void {
     }
   })
 
-  mainWindow.on('ready-to-show', () => {
-    mainWindow?.show()
-  })
+  mainWindow.on('ready-to-show', () => mainWindow.show())
 
-  mainWindow.webContents.setWindowOpenHandler((details) => {
-    require('electron').shell.openExternal(details.url)
-    return { action: 'deny' }
-  })
-
-  if (is.dev && process.env['ELECTRON_RENDERER_URL']) {
-    mainWindow.loadURL(process.env['ELECTRON_RENDERER_URL'])
+  if (process.env.ELECTRON_RENDERER_URL) {
+    mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL)
   } else {
     mainWindow.loadFile(path.join(__dirname, '../renderer/index.html'))
   }
 }
 
 app.whenReady().then(() => {
-  electronApp.setAppUserModelId('com.vorbyte')
-
-  app.on('browser-window-created', (_, window) => {
-    optimizer.watchWindowShortcuts(window)
-  })
-
-  createWindow()
-
   app.on('activate', function () {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
   })
+
+  ipcMain.handle('settings:get', async () => loadSettings())
+  ipcMain.handle('settings:save', async (_evt, next: AppSettings) => saveSettings(next))
+
+  ipcMain.handle('templates:list', async () => loadTemplatesIndex())
+  ipcMain.handle('templates:thumbnailData', async (_evt, templateId: string) => templateThumbnailData(templateId))
+
+  ipcMain.handle('projects:list', async () => listProjects())
+  ipcMain.handle('projects:create', async (_evt, req: CreateProjectRequest) => createProject(req))
+
+  ipcMain.handle('fs:tree', async (_evt, rootPath: string, opts?: { maxDepth?: number }) => {
+    const maxDepth = Math.max(1, Math.min(12, opts?.maxDepth ?? 5))
+    return buildTree(rootPath, maxDepth)
+  })
+
+  ipcMain.handle('dialog:selectDirectory', async (_evt, opts?: { title?: string; defaultPath?: string }) => {
+    const res = await dialog.showOpenDialog({
+      title: opts?.title ?? 'Select Folder',
+      defaultPath: opts?.defaultPath,
+      properties: ['openDirectory', 'createDirectory']
+    })
+    if (res.canceled) return null
+    return res.filePaths?.[0] ?? null
+  })
+
+  ipcMain.handle('chat:load', async (_evt, projectPath: string) => loadChat(projectPath))
+  ipcMain.handle('chat:clear', async (_evt, projectPath: string) => saveChat(projectPath, []))
+
+  ipcMain.handle('ai:run', async (_evt, req: any) => {
+    const result = await runAiAndApply({
+      requestId: req.requestId,
+      projectPath: req.projectPath,
+      provider: req.provider,
+      model: req.model,
+      messages: req.messages
+    })
+
+    // Append to chat history (persist)
+    const prior = await loadChat(req.projectPath)
+    const now = new Date().toISOString()
+    const next = [
+      ...prior,
+      ...req.messages.map((m: any) => ({
+        id: crypto.randomBytes(8).toString('hex'),
+        role: m.role,
+        content: m.content,
+        createdAt: now
+      })),
+      {
+        id: crypto.randomBytes(8).toString('hex'),
+        role: 'assistant',
+        content: result.summary,
+        createdAt: now
+      }
+    ]
+    await saveChat(req.projectPath, next)
+
+    return result
+  })
+
+  ipcMain.handle('ai:cancel', async (_evt, requestId: string) => {
+    const ctrl = running.get(requestId)
+    if (ctrl) ctrl.abort()
+  })
+
+  createWindow()
 })
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit()
-})
-
-/**
- * IPC handlers
- */
-ipcMain.handle('settings:get', async () => loadSettings())
-ipcMain.handle('settings:save', async (_evt, next: AppSettings) => saveSettings(next))
-
-ipcMain.handle('templates:list', async () => loadTemplatesIndex())
-ipcMain.handle('templates:thumbnailData', async (_evt, templateId: string) => templateThumbnailData(templateId))
-
-ipcMain.handle('projects:list', async () => listProjects())
-ipcMain.handle('projects:create', async (_evt, req: CreateProjectRequest) => createProject(req))
-
-ipcMain.handle('fs:tree', async (_evt, rootPath: string, opts?: { maxDepth?: number }) => {
-  const maxDepth = opts?.maxDepth ?? 5
-  return buildTree(rootPath, maxDepth)
-})
-
-ipcMain.handle('chat:load', async (_evt, projectPath: string) => loadChat(projectPath))
-ipcMain.handle('chat:clear', async (_evt, projectPath: string) => {
-  await saveChat(projectPath, [])
-  return true
-})
-
-ipcMain.handle('ai:run', async (_evt, req: AiRunRequest) => {
-  return runAiAndApply(req)
-})
-
-ipcMain.handle('ai:cancel', async (_evt, requestId: string) => {
-  const ac = aiRuns.get(requestId)
-  if (ac) ac.abort()
-  return true
-})
-
-ipcMain.handle('dialog:selectDirectory', async (_evt, opts?: { defaultPath?: string }) => {
-  const result = await dialog.showOpenDialog(mainWindow!, {
-    title: 'Select a folder',
-    properties: ['openDirectory'],
-    defaultPath: opts?.defaultPath
-  })
-  if (result.canceled) return null
-  return result.filePaths[0] ?? null
 })

@@ -23,26 +23,9 @@ export interface TemplateSummary {
   thumbnail?: string
   /**
    * Path relative to templates root (example: "templates/landing-page/overlay")
+   * Used by the main process when copying template files.
    */
   overlayDir: string
-  tags?: string[]
-}
-
-export interface CreateProjectRequest {
-  name: string
-  /**
-   * Omit/undefined means "Start from scratch"
-   */
-  templateId?: string
-  aiMode?: AiMode
-  cloudModel?: string
-  /**
-   * For Milestone 1/2: can be a local model name ("llama3.1") or "ollama:llama3.1".
-   * (Later: can become a richer config object.)
-   */
-  localModel?: string
-  enableImageGeneration?: boolean
-  initGit?: boolean
 }
 
 export interface ProjectSummary {
@@ -52,44 +35,33 @@ export interface ProjectSummary {
   templateId?: string
 }
 
-export type FileTreeNodeType = 'file' | 'dir'
-
 export interface FileTreeNode {
-  path: string
   name: string
-  type: FileTreeNodeType
+  path: string
+  type: 'file' | 'dir'
   children?: FileTreeNode[]
 }
 
-export interface EnvVarPair {
+export interface EnvVar {
   key: string
   value: string
 }
 
 export interface AppSettings {
-  /**
-   * Folder where projects are created/listed.
-   */
-  projectsRoot?: string
+  projectsRoot: string
+  openaiApiKey: string
+  localModelPath: string
+  envVars: EnvVar[]
+}
 
-  /**
-   * Stored for Milestone 1 persistence; secure storage can be added later.
-   */
-  openaiApiKey?: string
-
-  aiMode?: AiMode
+export interface CreateProjectRequest {
+  name: string
+  templateId: string
+  aiMode: AiMode
   cloudModel?: string
-
-  /**
-   * For Milestone 1 UI: can be a local model path OR a model name (Ollama).
-   * Milestone 2 uses it as a model name by default.
-   */
-  localModelPath?: string
-
-  /**
-   * Simple env var UI storage.
-   */
-  envVars?: EnvVarPair[]
+  localModel?: string
+  enableImageGeneration?: boolean
+  initGit?: boolean
 }
 
 export interface SelectDirectoryOptions {
@@ -97,22 +69,26 @@ export interface SelectDirectoryOptions {
   defaultPath?: string
 }
 
-/**
- * Milestone 2: run a prompt through the AI engine and apply file changes into the project dir.
- */
+export type EngineProvider = 'ollama' | 'openai'
+
 export interface AiRunRequest {
+  requestId: string
   projectPath: string
-  prompt: string
+  provider: EngineProvider
+  model: string
+  messages: { role: 'system' | 'user' | 'assistant'; content: string }[]
   /**
-   * Optional id for cancellation.
+   * If true, stream partial output back to the UI.
+   * (In Milestone 2 we still return the final text; streaming is optional.)
    */
-  requestId?: string
+  stream?: boolean
 }
 
 export interface AiRunResult {
-  chat: ChatMessage[]
-  appliedFiles: string[]
+  summary: string
+  writtenFiles: string[]
   installedDependencies: string[]
+  raw: string
 }
 
 export interface VorByteApi {
@@ -147,3 +123,15 @@ export interface VorByteApi {
     selectDirectory: (opts?: SelectDirectoryOptions) => Promise<string | null>
   }
 }
+
+/**
+ * Back-compat helpers.
+ * Some older UI code used flat function names (window.api.projectsCreate).
+ * Keep these around so refactors don't break the renderer.
+ */
+export interface VorByteApiCompat {
+  projectsList: () => Promise<ProjectSummary[]>
+  projectsCreate: (req: CreateProjectRequest) => Promise<ProjectSummary>
+}
+
+export type VorByteApiWithCompat = VorByteApi & VorByteApiCompat
