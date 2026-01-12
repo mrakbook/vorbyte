@@ -1,0 +1,8 @@
+{
+  "id": "dashboard",
+  "name": "Dashboard",
+  "description": "Basic dashboard shell with sidebar + cards",
+  "thumbnail": "thumbnail.svg",
+  "overlayDir": "overlay",
+  "tags": ["app", "layout", "data"]
+}
