@@ -94,6 +94,7 @@ function envPathAny(names: string[]): string | undefined {
   return undefined
 }
 
+
 function defaultProjectsRoot(): string {
   // Prefer explicit env if provided
   const p = envPathAny(['VORBYTE_PROJECTS_ROOT', 'vorbyte_PROJECTS_ROOT', 'LOCALFORGE_PROJECTS_ROOT'])
@@ -129,6 +130,7 @@ function sanitizeFolderName(name: string): string {
     .trim()
     .slice(0, 80)
 }
+
 
 async function readJson<T>(filePath: string): Promise<T | null> {
   try {
@@ -263,57 +265,155 @@ async function copyDir(src: string, dest: string) {
 
 async function createProject(req: CreateProjectRequest): Promise<ProjectSummary> {
   const settings = await loadSettings()
-  const root = settings.projectsRoot || defaultProjectsRoot()
-  await ensureDir(root)
+  const projectsRoot = settings.projectsRoot || defaultProjectsRoot()
+  await ensureDir(projectsRoot)
 
-  const displayName = (req.name ?? '').trim() || 'Untitled'
-  const safeName = sanitizeFolderName(displayName)
-  const projectPath = path.join(root, safeName)
+  const displayName = (req.name || 'Untitled').trim() || 'Untitled'
+  const folderBase = sanitizeFolderName(displayName)
+  const templateId = (req.templateId ?? 'scratch').trim() || 'scratch'
 
-  if (fssync.existsSync(projectPath)) {
-    throw new Error(`Project folder already exists: ${projectPath}`)
+  const kitPath = templateKitRoot()
+  if (!fssync.existsSync(kitPath)) {
+    throw new Error(
+      `Template kit not found at: ${kitPath}. Ensure packages/template-kit exists, or set VORBYTE_TEMPLATE_KIT_PATH.`
+    )
   }
 
-  const templateId = (req.templateId ?? 'scratch').trim()
-
-  await ensureDir(projectPath)
-
-  // Always start from template-kit (the base scaffold)
-  const kitRoot = templateKitRoot()
-  if (!fssync.existsSync(kitRoot)) {
-    throw new Error(`Template kit not found at: ${kitRoot}`)
-  }
-  await copyDir(kitRoot, projectPath)
-
-  // If not scratch, overlay selected template onto the kit
-  if (templateId !== 'scratch') {
+  const applyTemplateOverlay = async (projectPath: string) => {
+    if (templateId === 'scratch') return
+    const templatesRootAbs = templatesRoot()
     const templates = await loadTemplatesIndex()
     const t = templates.find((x) => x.id === templateId)
-    if (!t) {
-      throw new Error(`Template not found: ${templateId}`)
+    if (!t) throw new Error(`Template not found: ${templateId}`)
+
+    const overlayPath = path.isAbsolute(t.overlayDir) ? t.overlayDir : path.join(templatesRootAbs, t.overlayDir)
+    if (!fssync.existsSync(overlayPath)) {
+      throw new Error(`Overlay directory not found for template '${templateId}': ${overlayPath}`)
     }
-    const overlayAbs = path.isAbsolute(t.overlayDir) ? t.overlayDir : path.join(templatesRoot(), t.overlayDir)
-    if (!fssync.existsSync(overlayAbs)) {
-      throw new Error(`Template overlay dir missing: ${overlayAbs}`)
-    }
-    await copyDir(overlayAbs, projectPath)
+    await copyDir(overlayPath, projectPath)
   }
 
-  const createdAt = new Date().toISOString()
+  const writeMetaAndChatIfMissing = async (projectPath: string, createdAt: string) => {
+    const metaPath = path.join(projectPath, PROJECT_META_PATH)
+    const chatPath = path.join(projectPath, CHAT_HISTORY_PATH)
 
+    const existingMeta = await readJson<any>(metaPath)
+    if (!existingMeta) {
+      const meta = {
+        name: displayName,
+        createdAt,
+        templateId,
+        ai: {
+          aiMode: req.aiMode,
+          cloudModel: req.cloudModel ?? null,
+          localModel: req.localModel ?? null,
+          enableImageGeneration: !!req.enableImageGeneration
+        },
+        initGit: !!req.initGit
+      }
+      await writeJsonAtomic(metaPath, meta)
+    }
+
+    if (!fssync.existsSync(chatPath)) {
+      await writeJsonAtomic(chatPath, [])
+    }
+  }
+
+  const openOrAdoptExistingProject = async (projectPath: string): Promise<ProjectSummary> => {
+    const metaPath = path.join(projectPath, PROJECT_META_PATH)
+    const stat = await fs.stat(projectPath)
+    const createdAt = stat.birthtime?.toISOString?.() ?? new Date().toISOString()
+
+    // If it already has meta, just return it
+    const meta = await readJson<any>(metaPath)
+    if (meta) {
+      await writeMetaAndChatIfMissing(projectPath, meta.createdAt ?? createdAt)
+      return {
+        name: meta.name ?? displayName,
+        path: projectPath,
+        createdAt: meta.createdAt ?? createdAt,
+        templateId: meta.templateId ?? templateId
+      }
+    }
+
+    // If the folder exists but doesn't look like a Next.js project yet, we can "repair" it
+    // ONLY when it's empty-ish (so we don't overwrite user data).
+    const pkgPath = path.join(projectPath, 'package.json')
+    const hasPkg = fssync.existsSync(pkgPath)
+
+    if (!hasPkg) {
+      const entries = await fs.readdir(projectPath).catch(() => [])
+      const nonMetaEntries = entries.filter((e) => e !== '.vorbyte' && e !== '.git')
+      const safeToScaffold = nonMetaEntries.length === 0
+
+      if (safeToScaffold) {
+        await copyDir(kitPath, projectPath)
+        await applyTemplateOverlay(projectPath)
+
+        const repairedAt = new Date().toISOString()
+        await writeMetaAndChatIfMissing(projectPath, repairedAt)
+        return { name: displayName, path: projectPath, createdAt: repairedAt, templateId }
+      }
+    }
+
+    // Otherwise: adopt the folder as a VorByte project by writing meta (without touching files)
+    await writeMetaAndChatIfMissing(projectPath, createdAt)
+    const adoptedMeta = await readJson<any>(metaPath)
+
+    return {
+      name: adoptedMeta?.name ?? displayName,
+      path: projectPath,
+      createdAt: adoptedMeta?.createdAt ?? createdAt,
+      templateId: adoptedMeta?.templateId ?? templateId
+    }
+  }
+
+  // Target folder path (default behavior is "open existing" rather than error)
+  let projectPath = path.join(projectsRoot, folderBase)
+
+  if (fssync.existsSync(projectPath)) {
+    const stat = await fs.stat(projectPath).catch(() => null)
+    if (stat?.isDirectory()) {
+      return await openOrAdoptExistingProject(projectPath)
+    }
+
+    // It's a file (or something odd) -> create a unique folder name
+    let n = 2
+    while (fssync.existsSync(projectPath)) {
+      projectPath = path.join(projectsRoot, `${folderBase}-${n}`)
+      n += 1
+    }
+  }
+
+  // 1) Copy template kit scaffold
+  await copyDir(kitPath, projectPath)
+
+  // 2) Apply template overlay (optional)
+  await applyTemplateOverlay(projectPath)
+
+  // 3) Write project metadata
+  const createdAt = new Date().toISOString()
   const meta = {
     name: displayName,
     createdAt,
     templateId,
     ai: {
-      aiMode: req.aiMode ?? settings.aiMode ?? 'local',
-      cloudModel: req.cloudModel ?? settings.cloudModel ?? 'gpt-4o-mini',
-      localModel: req.localModel ?? settings.localModelPath ?? 'ollama:llama3.1'
-    }
+      aiMode: req.aiMode,
+      cloudModel: req.cloudModel ?? null,
+      localModel: req.localModel ?? null,
+      enableImageGeneration: !!req.enableImageGeneration
+    },
+    initGit: !!req.initGit
   }
 
-  await writeJsonAtomic(path.join(projectPath, PROJECT_META_PATH), meta)
+  const metaPath = path.join(projectPath, PROJECT_META_PATH)
+  await writeJsonAtomic(metaPath, meta)
 
+  // 4) Create chat history file
+  const chatPath = path.join(projectPath, CHAT_HISTORY_PATH)
+  await writeJsonAtomic(chatPath, [])
+
+  // 5) Optionally init git
   if (req.initGit) {
     // No-op for now (Milestone 1 already had this stub).
     // You can add: spawn('git', ['init'], { cwd: projectPath }) in Milestone 3/4.
@@ -365,7 +465,7 @@ function buildSystemPrompt(): string {
   return [
     'You are VorByte, an expert Next.js (App Router) + Tailwind + shadcn/ui developer.',
     '',
-    "Your job is to generate or modify code in the user's Next.js project.",
+    'Your job is to generate or modify code in the user\'s Next.js project.',
     '',
     'Hard requirements:',
     '- Use Next.js App Router conventions (app/ directory).',
@@ -478,9 +578,9 @@ async function runAiAndApply(req: AiRunRequest): Promise<AiRunResult> {
         ? (() => {
             const baseUrl = firstEnv(['VORBYTE_OPENAI_BASE_URL', 'vorbyte_OPENAI_BASE_URL'])
             const apiKey = settings.openaiApiKey?.trim() ?? ''
-            const isLocalBaseUrl = !!baseUrl && /(localhost|127\.0\.0\.1)/.test(baseUrl)
+            const isLocalBaseUrl = !!baseUrl && /(localhost|127\.0\.0\.1|::1|\[::1\])/.test(baseUrl)
             if (!apiKey && !isLocalBaseUrl) {
-              throw new Error('OpenAI API key is missing. Set it in Settings (Cloud mode).')
+              throw new Error('OpenAI API key is missing.\n\nGo to Settings → OpenAI API Key and paste your key, then try again.\n\nTip: For offline/local use, create the project with AI Mode = Local (Ollama).')
             }
             return createAIEngine({
               provider: 'openai',
@@ -489,7 +589,7 @@ async function runAiAndApply(req: AiRunRequest): Promise<AiRunResult> {
           })()
         : (() => {
             const { model } = parseLocalModel(localModelRaw)
-            const baseUrl = firstEnv(['VORBYTE_OLLAMA_BASE_URL', 'vorbyte_OLLAMA_BASE_URL']) ?? 'http://localhost:11434'
+            const baseUrl = firstEnv(['VORBYTE_OLLAMA_BASE_URL', 'vorbyte_OLLAMA_BASE_URL']) ?? 'http://127.0.0.1:11434'
             return createAIEngine({
               provider: 'ollama',
               ollama: { baseUrl, model, temperature: 0.2 }
