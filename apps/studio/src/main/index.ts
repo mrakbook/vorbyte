@@ -33,8 +33,8 @@ const CHAT_HISTORY_PATH = path.join('.vorbyte', 'chat.json')
 
 const SETTINGS_PATH = path.join(app.getPath('userData'), 'settings.json')
 
-const SKIP_TREE_NAMES = new Set(['node_modules', '.next', '.git', '.vorbyte'])
-const SKIP_COPY_NAMES = new Set(['node_modules', '.next', '.git', '.DS_Store'])
+const SKIP_TREE_NAMES = new Set(['node_modules', '.next', '.git', '.vorbyte', 'dist', 'out'])
+const SKIP_COPY_NAMES = new Set(['node_modules', '.next', '.git', '.DS_Store', 'dist', 'out'])
 
 /**
  * AbortControllers for in-flight AI runs (for cancel button).
@@ -178,8 +178,15 @@ async function saveSettings(next: AppSettings): Promise<AppSettings> {
 async function loadTemplatesIndex(): Promise<TemplateSummary[]> {
   const root = templatesRoot()
   const indexPath = path.join(root, 'templates.index.json')
-  const data = await readJson<{ templates: TemplateSummary[] }>(indexPath)
-  return data?.templates ?? []
+  const data = await readJson<any>(indexPath)
+
+  // Support both formats:
+  // 1) Array of templates: [ { id, name, ... } ]
+  // 2) Wrapped object: { templates: [ ... ] }
+  if (Array.isArray(data)) return data as TemplateSummary[]
+  if (data && Array.isArray(data.templates)) return data.templates as TemplateSummary[]
+
+  return []
 }
 
 async function templateThumbnailData(templateId: string): Promise<string | null> {

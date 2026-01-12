@@ -529,13 +529,14 @@ export default function App() {
 
   const [mode, setMode] = useState<'chat' | 'design'>('chat')
   const [messages, setMessages] = useState<ChatMessage[]>([])
-  const [chatBusy, setChatBusy] = useState(false)
   const [draft, setDraft] = useState('')
 
   const [newProjectOpen, setNewProjectOpen] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
 
   const [busy, setBusy] = useState(false)
+  const [aiBusy, setAiBusy] = useState(false)
+  const [aiRequestId, setAiRequestId] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   const chatEndRef = useRef<HTMLDivElement | null>(null)
@@ -560,21 +561,17 @@ export default function App() {
   }
 
   useEffect(() => {
+    void refreshAll()
+  }, [])
+
+  useEffect(() => {
     if (!activeProject) return
     ;(async () => {
       try {
         const nextTree = await window.api.fs.tree(activeProject.path, { maxDepth: 6 })
         setTree(nextTree)
-      } catch (e) {
-        console.warn('Failed to load file tree', e)
+      } catch {
         setTree(null)
-      }
-      try {
-        const nextChat = await window.api.chat.load(activeProject.path)
-        setMessages(nextChat)
-      } catch (e) {
-        console.warn('Failed to load chat history', e)
-        setMessages([])
       }
     })()
   }, [activeProject])
@@ -586,8 +583,24 @@ export default function App() {
   async function openProject(p: ProjectSummary) {
     setActiveProject(p)
     setMode('chat')
-    setMessages([])
     setDraft('')
+    setError(null)
+    try {
+      const chat = await window.api.chat.load(p.path)
+      setMessages(chat)
+    } catch {
+      setMessages([])
+    }
+  }
+
+  async function cancelAi() {
+    if (!aiRequestId) return
+    try {
+      await window.api.ai.cancel(aiRequestId)
+    } finally {
+      setAiRequestId(null)
+      setAiBusy(false)
+    }
   }
 
   async function createProject(req: CreateProjectRequest) {
@@ -599,47 +612,44 @@ export default function App() {
   async function sendMessage() {
     const content = draft.trim()
     if (!content) return
-    if (!activeProject) return
-    if (chatBusy) return
-
-    const userMsg: ChatMessage = {
-      id: randomId(),
-      role: 'user',
-      content,
-      createdAt: new Date().toISOString()
+    if (!activeProject) {
+      setError('No project is open.')
+      return
     }
 
-    const placeholderId = randomId()
-    const placeholder: ChatMessage = {
-      id: placeholderId,
+    // Optimistic UI: show the user's message + a temporary assistant placeholder
+    const userMsg: ChatMessage = { id: uid(), role: 'user', content, createdAt: new Date().toISOString() }
+    const pendingId = uid()
+    const pendingMsg: ChatMessage = {
+      id: pendingId,
       role: 'assistant',
       content: 'Generating…',
       createdAt: new Date().toISOString()
     }
-
+    setMessages((m) => [...m, userMsg, pendingMsg])
     setDraft('')
-    setChatBusy(true)
-    setMessages((prev) => [...prev, userMsg, placeholder])
+    setError(null)
+
+    const requestId = uid()
+    setAiRequestId(requestId)
+    setAiBusy(true)
 
     try {
-      const result = await window.api.ai.run({ projectPath: activeProject.path, prompt: content })
-      setMessages(result.chat)
-      // Refresh file tree (the AI may have created/updated files)
-      const nextTree = await window.api.fs.tree(activeProject.path, { maxDepth: 6 })
-      setTree(nextTree)
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
-      setMessages((prev) => [
-        ...prev.filter((m) => m.id !== placeholderId),
-        {
-          id: randomId(),
-          role: 'assistant',
-          content: `⚠️ ${msg}`,
-          createdAt: new Date().toISOString()
-        }
-      ])
+      const res = await window.api.ai.run({ projectPath: activeProject.path, prompt: content, requestId })
+      setMessages(res.chat)
+      // Refresh file tree so the sidebar reflects newly created/edited files
+      const t = await window.api.fs.tree(activeProject.path, { maxDepth: 6 })
+      setTree(t)
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      // Replace the pending message with the error
+      setMessages((m) =>
+        m.map((x) => (x.id === pendingId ? { ...x, content: `⚠️ ${msg}` } : x))
+      )
+      setError(msg)
     } finally {
-      setChatBusy(false)
+      setAiBusy(false)
+      setAiRequestId(null)
     }
   }
 
@@ -865,20 +875,21 @@ export default function App() {
                     placeholder="Describe what you want to build…"
                     value={draft}
                     onChange={(e) => setDraft(e.target.value)}
+                    disabled={aiBusy}
                     onKeyDown={onChatKeyDown}
                   />
                   <div className="mt-2 flex justify-end">
                     <button
-                      className={`rounded px-4 py-2 text-sm text-white ${
-                        chatBusy || !draft.trim()
-                          ? 'cursor-not-allowed bg-zinc-400'
-                          : 'bg-black hover:bg-zinc-800'
-                      }`}
+                      className="rounded bg-black px-4 py-2 text-sm text-white hover:bg-zinc-800"
                       onClick={sendMessage}
-                      disabled={chatBusy || !draft.trim()}
                     >
-                      {chatBusy ? 'Generating…' : 'Send'}
+                      {aiBusy ? 'Generating…' : 'Send'}
                     </button>
+                    {aiBusy && (
+                      <button className="btn" onClick={cancelAi}>
+                        Stop
+                      </button>
+                    )}
                   </div>
                 </div>
               </div>

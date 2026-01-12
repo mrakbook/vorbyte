@@ -115,7 +115,7 @@ export interface AiRunResult {
   installedDependencies: string[]
 }
 
-export interface vorbyteApi {
+export interface VorByteApi {
   projects: {
     list: () => Promise<ProjectSummary[]>
     create: (req: CreateProjectRequest) => Promise<ProjectSummary>
