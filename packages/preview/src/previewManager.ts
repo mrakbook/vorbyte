@@ -29,6 +29,11 @@ const MAX_LOG_LINES = 900;
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_READY_TIMEOUT_MS = 180_000;
 
+// Tailwind v4 stack (required by template-kit globals.css which uses `@import "tailwindcss";`)
+const TAILWIND_V4 = "^4.1.18";
+const TAILWIND_POSTCSS_V4 = "^4.1.18";
+const TW_ANIMATE_CSS = "^1.4.0";
+
 function nowIso() {
   return new Date().toISOString();
 }
@@ -178,10 +183,19 @@ async function runCommandCapture(inst: Instance, cmd: string, args: string[], cw
   });
 }
 
+function resolveNextBin(projectPath: string): string | null {
+  const bin = path.join(projectPath, "node_modules", ".bin", process.platform === "win32" ? "next.cmd" : "next");
+  return fileExists(bin) ? bin : null;
+}
+
 async function ensureDeps(inst: Instance, pm: PackageManager, projectPath: string) {
   const nm = path.join(projectPath, "node_modules");
-  if (fileExists(nm)) return;
-  pushLogLine(inst, "📦 Installing dependencies (first run)…");
+  const nextBin = resolveNextBin(projectPath);
+
+  // If node_modules exists but Next isn't runnable, we still need an install.
+  if (fileExists(nm) && nextBin) return;
+
+  pushLogLine(inst, "📦 Installing dependencies…");
   if (pm === "pnpm") {
     await runCommandCapture(inst, "pnpm", ["install"], projectPath);
     return;
@@ -209,15 +223,23 @@ function toStatus(inst: Instance): PreviewStatus {
 
 async function killProcessTree(proc: ChildProcessWithoutNullStreams) {
   if (proc.killed) return;
-  try { proc.kill("SIGTERM"); } catch {}
+  try {
+    proc.kill("SIGTERM");
+  } catch {}
   await new Promise((r) => setTimeout(r, 1600));
   if (!proc.killed) {
-    try { proc.kill("SIGKILL"); } catch {}
+    try {
+      proc.kill("SIGKILL");
+    } catch {}
   }
 }
 
 async function readText(p: string): Promise<string | null> {
-  try { return await fs.promises.readFile(p, "utf-8"); } catch { return null; }
+  try {
+    return await fs.promises.readFile(p, "utf-8");
+  } catch {
+    return null;
+  }
 }
 
 async function writeText(p: string, s: string): Promise<void> {
@@ -225,21 +247,192 @@ async function writeText(p: string, s: string): Promise<void> {
   await fs.promises.writeFile(p, s.endsWith("\n") ? s : s + "\n", "utf-8");
 }
 
+async function readJson<T>(p: string): Promise<T | null> {
+  try {
+    const raw = await fs.promises.readFile(p, "utf-8");
+    return JSON.parse(raw) as T;
+  } catch {
+    return null;
+  }
+}
+
+async function writeJson(p: string, v: unknown): Promise<void> {
+  await fs.promises.mkdir(path.dirname(p), { recursive: true });
+  await fs.promises.writeFile(p, JSON.stringify(v, null, 2) + "\n", "utf-8");
+}
+
+async function renameToBak(p: string): Promise<void> {
+  try {
+    const bak = `${p}.bak`;
+    if (fileExists(bak)) await fs.promises.rm(bak, { force: true });
+    await fs.promises.rename(p, bak);
+  } catch {
+    // ignore
+  }
+}
+
 /**
- * Repair common AI-generated Next.js App Router breakages that cause `next dev` to exit instantly.
- * This does NOT try to be perfect; it only fixes very specific, clearly-wrong patterns.
+ * Best-effort TS → ESM conversion for common Next config patterns.
+ * We only need this because Next 14 does not support `next.config.ts`.
  */
-async function repairProjectForPreview(inst: Instance, projectPath: string): Promise<void> {
-  const layoutCandidates = [
-    path.join(projectPath, "src/app/layout.tsx"),
-    path.join(projectPath, "app/layout.tsx"),
+function convertNextConfigTsToMjs(ts: string): string {
+  let s = ts.replace(/\r\n/g, "\n");
+
+  // Remove type-only import for NextConfig.
+  s = s.replace(/import\s+type\s*\{\s*NextConfig\s*\}\s*from\s*['"]next['"]\s*;?\s*/g, "");
+  s = s.replace(/import\s*\{\s*NextConfig\s*\}\s*from\s*['"]next['"]\s*;?\s*/g, "");
+
+  // Remove type annotations and `satisfies NextConfig`.
+  s = s.replace(/:\s*NextConfig\b/g, "");
+  s = s.replace(/\s+satisfies\s+NextConfig\b/g, "");
+
+  // If it's using `module.exports =`, convert to `export default`.
+  if (/module\.exports\s*=/.test(s)) {
+    s = s.replace(/module\.exports\s*=\s*/g, "export default ");
+  }
+
+  // Ensure it has an `export default` somewhere.
+  if (!/export\s+default\b/.test(s)) {
+    // If it declares `const nextConfig = { ... }`, export it.
+    if (/const\s+nextConfig\s*=/.test(s)) {
+      s += "\n\nexport default nextConfig;\n";
+    }
+  }
+
+  // Normalize trailing newline
+  return s.endsWith("\n") ? s : s + "\n";
+}
+
+function rewriteGeistFontsToInter(src: string): string {
+  let s = src;
+  s = s.replace(
+    /import\s*\{\s*Geist\s*,\s*Geist_Mono\s*\}\s*from\s*['"]next\/font\/google['"];?/g,
+    'import { Inter, Roboto_Mono } from "next/font/google";'
+  );
+  s = s.replace(/\bGeist_Mono\b/g, "Roboto_Mono");
+  s = s.replace(/\bGeist\b/g, "Inter");
+  // Add display swap if missing
+  s = s.replace(/subsets:\s*\[([^\]]+)\],\s*\}\);/g, 'subsets: [$1],\n  display: "swap",\n});');
+  return s;
+}
+
+function projectUsesTailwindV4(globalsCss: string | null, postcssCfg: string | null): boolean {
+  const css = globalsCss ?? "";
+  const pc = postcssCfg ?? "";
+  return (
+    /@import\s+["']tailwindcss["']/.test(css) ||
+    /@theme\s+inline\b/.test(css) ||
+    /@custom-variant\s+dark\b/.test(css) ||
+    /@tailwindcss\/postcss/.test(pc)
+  );
+}
+
+/**
+ * Repair common AI-generated / template-kit stack mismatch issues that cause `next dev` to error.
+ * Returns true if we modified package.json / PostCSS config and should re-install.
+ */
+async function repairProjectForPreview(inst: Instance, projectPath: string): Promise<{ reinstallDeps: boolean }> {
+  let reinstallDeps = false;
+
+  // 0) Next.js 14 cannot load next.config.ts — convert or remove it.
+  const nextConfigTs = path.join(projectPath, "next.config.ts");
+  const nextConfigMjs = path.join(projectPath, "next.config.mjs");
+  const nextConfigJs = path.join(projectPath, "next.config.js");
+
+  if (fileExists(nextConfigTs)) {
+    if (!fileExists(nextConfigMjs) && !fileExists(nextConfigJs)) {
+      pushLogLine(inst, "🛠 Repair: Migrating unsupported next.config.ts → next.config.mjs");
+      const ts = await readText(nextConfigTs);
+      if (ts) {
+        await writeText(nextConfigMjs, convertNextConfigTsToMjs(ts));
+      }
+    } else {
+      pushLogLine(inst, "🛠 Repair: Removing unsupported next.config.ts (keeping existing JS/MJS config)");
+    }
+    await renameToBak(nextConfigTs);
+  }
+
+  const globalsCandidates = [
+    path.join(projectPath, "src/app/globals.css"),
+    path.join(projectPath, "app/globals.css"),
+    path.join(projectPath, "src/styles/globals.css"),
+    path.join(projectPath, "styles/globals.css"),
   ];
-  const pageCandidates = [
-    path.join(projectPath, "src/app/page.tsx"),
-    path.join(projectPath, "app/page.tsx"),
+  const postcssCandidates = [
+    path.join(projectPath, "postcss.config.mjs"),
+    path.join(projectPath, "postcss.config.js"),
+    path.join(projectPath, "postcss.config.cjs"),
   ];
 
-  // 1) Fix invalid App Router layout created from next/app (Pages Router API).
+  const globalsPath = globalsCandidates.find((p) => fileExists(p)) ?? null;
+  const postcssPath = postcssCandidates.find((p) => fileExists(p)) ?? null;
+
+  const globalsCss = globalsPath ? await readText(globalsPath) : null;
+  const postcssCfg = postcssPath ? await readText(postcssPath) : null;
+
+  // 1) If the project looks like Tailwind v4 (template-kit), ensure the matching deps + PostCSS plugin.
+  if (projectUsesTailwindV4(globalsCss, postcssCfg)) {
+    const pkgPath = path.join(projectPath, "package.json");
+    const pkg = await readJson<any>(pkgPath);
+
+    if (pkg) {
+      let changed = false;
+
+      // Ensure PostCSS plugin config exists and is v4 style.
+      const expected = `const config = {\n  plugins: {\n    "@tailwindcss/postcss": {},\n  },\n};\n\nexport default config;\n`;
+      if (postcssPath) {
+        if (!/@tailwindcss\/postcss/.test(postcssCfg ?? "")) {
+          pushLogLine(inst, `🛠 Repair: Updating PostCSS config to Tailwind v4 (@tailwindcss/postcss): ${path.relative(projectPath, postcssPath)}`);
+          await renameToBak(postcssPath);
+          await writeText(path.join(projectPath, "postcss.config.mjs"), expected);
+          reinstallDeps = true;
+        }
+      } else {
+        pushLogLine(inst, "🛠 Repair: Adding missing PostCSS config for Tailwind v4 (postcss.config.mjs)");
+        await writeText(path.join(projectPath, "postcss.config.mjs"), expected);
+        reinstallDeps = true;
+      }
+
+      // Ensure required deps exist (and are v4 compatible).
+      pkg.dependencies = pkg.dependencies ?? {};
+      pkg.devDependencies = pkg.devDependencies ?? {};
+
+      if (pkg.dependencies["tw-animate-css"] == null && pkg.devDependencies["tw-animate-css"] == null) {
+        pkg.dependencies["tw-animate-css"] = TW_ANIMATE_CSS;
+        changed = true;
+      }
+
+      if (pkg.devDependencies.tailwindcss == null && pkg.dependencies.tailwindcss == null) {
+        pkg.devDependencies.tailwindcss = TAILWIND_V4;
+        changed = true;
+      } else if (typeof pkg.devDependencies.tailwindcss === "string" && pkg.devDependencies.tailwindcss.startsWith("^3")) {
+        pkg.devDependencies.tailwindcss = TAILWIND_V4;
+        changed = true;
+      }
+
+      if (pkg.devDependencies["@tailwindcss/postcss"] == null && pkg.dependencies["@tailwindcss/postcss"] == null) {
+        pkg.devDependencies["@tailwindcss/postcss"] = TAILWIND_POSTCSS_V4;
+        changed = true;
+      } else if (
+        typeof pkg.devDependencies["@tailwindcss/postcss"] === "string" &&
+        pkg.devDependencies["@tailwindcss/postcss"].startsWith("^3")
+      ) {
+        pkg.devDependencies["@tailwindcss/postcss"] = TAILWIND_POSTCSS_V4;
+        changed = true;
+      }
+
+      if (changed) {
+        pushLogLine(inst, "🛠 Repair: Ensuring Tailwind v4 dependencies are present in package.json");
+        await writeJson(pkgPath, pkg);
+        reinstallDeps = true;
+      }
+    }
+  }
+
+  const layoutCandidates = [path.join(projectPath, "src/app/layout.tsx"), path.join(projectPath, "app/layout.tsx")];
+  const pageCandidates = [path.join(projectPath, "src/app/page.tsx"), path.join(projectPath, "app/page.tsx")];
+
+  // 2) Fix invalid App Router layout created from next/app (Pages Router API).
   for (const layoutPath of layoutCandidates) {
     const src = await readText(layoutPath);
     if (!src) continue;
@@ -271,14 +464,20 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
 }
 `;
       await writeText(layoutPath, fixed);
+      continue;
+    }
+
+    // 3) Fix next/font Geist errors by switching to Inter/Roboto Mono while keeping the same CSS vars.
+    if (src.includes("next/font/google") && (src.includes("Geist") || src.includes("Geist_Mono"))) {
+      pushLogLine(inst, `🛠 Repair: Rewriting Geist font import to Inter/Roboto_Mono: ${path.relative(projectPath, layoutPath)}`);
+      await writeText(layoutPath, rewriteGeistFontsToInter(src));
     }
   }
 
-  // 2) Ensure a minimal Button component exists if the project uses shadcn-style imports.
+  // 4) Ensure a minimal Button component exists if the project uses shadcn-style imports.
   const buttonRel = "src/components/ui/button.tsx";
   const buttonAbs = path.join(projectPath, buttonRel);
   if (!fileExists(buttonAbs)) {
-    // only add if we detect usage of Button in pages
     let usesButton = false;
     for (const pagePath of pageCandidates) {
       const src = await readText(pagePath);
@@ -323,21 +522,16 @@ Button.displayName = "Button";
     }
   }
 
-  // 3) Rewrite bad imports like `import { Button } from '@shadcn/ui'` to local components.
+  // 5) Rewrite bad imports like `import { Button } from '@shadcn/ui'` to local components.
   for (const pagePath of pageCandidates) {
     const src = await readText(pagePath);
     if (!src) continue;
 
     let next = src;
 
-    next = next.replace(/from\s+['"]@shadcn\/ui['"]/g, "from \"@/components/ui/button\"");
-    next = next.replace(/from\s+['"]shadcn\/ui['"]/g, "from \"@/components/ui/button\"");
+    next = next.replace(/from\s+['"]@shadcn\/ui['"]/g, 'from "@/components/ui/button"');
+    next = next.replace(/from\s+['"]shadcn\/ui['"]/g, 'from "@/components/ui/button"');
     next = next.replace(/import\s*\{\s*Button\s*\}\s*from\s*['"][^'"]*['"]\s*;?/g, 'import { Button } from "@/components/ui/button";');
-
-    // Also fix react 19 type errors in some templates by ensuring React import if JSX requires it (safe no-op in Next).
-    if (!next.includes("import React") && next.includes("function HomePage")) {
-      // Not necessary, but harmless.
-    }
 
     if (next !== src) {
       pushLogLine(inst, `🛠 Repair: Fixing bad Button import in ${path.relative(projectPath, pagePath)}`);
@@ -345,7 +539,7 @@ Button.displayName = "Button";
     }
   }
 
-  // 4) Ensure tsconfig path alias for @/ exists? Too invasive; skip.
+  return { reinstallDeps };
 }
 
 class PreviewManagerImpl implements PreviewManager {
@@ -404,9 +598,24 @@ class PreviewManagerImpl implements PreviewManager {
     const pm = await detectPackageManager(projectPath);
     pushLogLine(inst, `ℹ Using package manager: ${pm}`);
 
+    // Repair project structure/config first (may update package.json / postcss config)
+    let repairReinstall = false;
+    try {
+      const repairRes = await repairProjectForPreview(inst, projectPath);
+      repairReinstall = repairRes.reinstallDeps;
+    } catch (e: any) {
+      pushLogLine(inst, `⚠ Repair step failed: ${e?.message ?? String(e)}`);
+    }
+
     if (opts.autoInstallDeps !== false) {
       try {
         await ensureDeps(inst, pm, projectPath);
+        if (repairReinstall) {
+          pushLogLine(inst, "📦 Re-installing dependencies after repair…");
+          if (pm === "pnpm") await runCommandCapture(inst, "pnpm", ["install"], projectPath);
+          else if (pm === "yarn") await runCommandCapture(inst, "yarn", ["install"], projectPath);
+          else await runCommandCapture(inst, "npm", ["install"], projectPath);
+        }
       } catch (e: any) {
         inst.state = "error";
         inst.error = e?.message ?? String(e);
@@ -415,28 +624,35 @@ class PreviewManagerImpl implements PreviewManager {
       }
     }
 
-    // Repair common AI breakages before starting next dev.
-    try {
-      await repairProjectForPreview(inst, projectPath);
-    } catch (e: any) {
-      pushLogLine(inst, `⚠ Repair step failed: ${e?.message ?? String(e)}`);
-    }
-
     const portStr = String(inst.port);
-    let cmd = pm;
-    let args: string[] = [];
 
-    if (pm === "pnpm") args = ["dev", "--", "-p", portStr, "-H", host];
-    else if (pm === "yarn") args = ["dev", "-p", portStr, "-H", host];
-    else {
+    // Prefer running Next directly to avoid package-manager argument quirks (esp. pnpm + "--").
+    const nextBin = resolveNextBin(projectPath);
+    let cmd: string;
+    let args: string[];
+
+    if (nextBin) {
+      cmd = nextBin;
+      args = ["dev", "-p", portStr, "-H", host];
+    } else if (pm === "pnpm") {
+      cmd = "pnpm";
+      args = ["exec", "next", "dev", "-p", portStr, "-H", host];
+    } else if (pm === "yarn") {
+      cmd = "yarn";
+      args = ["exec", "next", "dev", "-p", portStr, "-H", host];
+    } else {
       cmd = "npm";
-      args = ["run", "dev", "--", "-p", portStr, "-H", host];
+      args = ["exec", "next", "--", "dev", "-p", portStr, "-H", host];
     }
 
     pushLogLine(inst, `▶ ${cmd} ${args.join(" ")}`);
 
     try {
-      const proc = spawn(cmd, args, { cwd: projectPath, shell: process.platform === "win32", env: { ...process.env, PORT: portStr, HOSTNAME: host } });
+      const proc = spawn(cmd, args, {
+        cwd: projectPath,
+        shell: process.platform === "win32",
+        env: { ...process.env, PORT: portStr, HOSTNAME: host },
+      });
       inst.proc = proc;
       inst.pid = proc.pid;
 
@@ -454,8 +670,7 @@ class PreviewManagerImpl implements PreviewManager {
         inst!.exited = true;
         inst!.state = "error";
         const tail = inst!.logs.slice(-120).join("\n");
-        inst!.error =
-          `Preview server exited early (code=${code ?? "n/a"} signal=${signal ?? "n/a"}).\n\nLast logs:\n${tail}`;
+        inst!.error = `Preview server exited early (code=${code ?? "n/a"} signal=${signal ?? "n/a"}).\n\nLast logs:\n${tail}`;
         pushLogLine(inst!, `✖ Preview server exited early.`);
       });
     } catch (e: any) {

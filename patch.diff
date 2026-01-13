@@ -1,0 +1,98 @@
+--- a/packages/template-kit/next.config.ts
++++ /dev/null
+@@ -1,8 +0,0 @@
+-import type { NextConfig } from "next";
+-
+-const nextConfig: NextConfig = {
+-  /* config options here */
+-};
+-
+-export default nextConfig;
+-
+
+--- /dev/null
++++ b/packages/template-kit/next.config.mjs
+@@ -0,0 +1,6 @@
++/** @type {import('next').NextConfig} */
++const nextConfig = {
++  /* config options here */
++};
++
++export default nextConfig;
+
+--- a/packages/preview/src/previewManager.ts
++++ b/packages/preview/src/previewManager.ts
+@@ -225,11 +225,73 @@
+   await fs.promises.writeFile(p, s.endsWith("\n") ? s : s + "\n", "utf-8");
+ }
+ 
++function convertNextConfigTsToMjs(tsSource: string | null): string {
++  const fallback = `/** @type {import('next').NextConfig} */
++const nextConfig = {
++  /* config options here */
++};
++
++export default nextConfig;
++`;
++  if (!tsSource) return fallback;
++
++  let s = tsSource.replace(/\r\n/g, "\n");
++
++  // Drop NextConfig imports (common in TS configs).
++  s = s.replace(/^\s*import\s+type\s+\{\s*NextConfig\s*\}\s+from\s+['\"]next['\"]\s*;?\s*$/gm, "");
++  s = s.replace(/^\s*import\s+\{\s*NextConfig\s*\}\s+from\s+['\"]next['\"]\s*;?\s*$/gm, "");
++
++  // Remove TS-only annotations.
++  s = s.replace(/\b:\s*NextConfig\b/g, "");
++  s = s.replace(/\s+satisfies\s+NextConfig\b/g, "");
++  s = s.replace(/\s+as\s+NextConfig\b/g, "");
++
++  // Ensure a JSDoc type hint exists (keeps editor help).
++  if (!s.includes("import('next').NextConfig") && !s.includes('import("next").NextConfig')) {
++    const re = /^(\s*)const\s+\w+Config\b/m;
++    if (re.test(s)) {
++      s = s.replace(re, (m, indent) => `${indent}/** @type {import('next').NextConfig} */\n${m}`);
++    } else {
++      s = `/** @type {import('next').NextConfig} */\n` + s;
++    }
++  }
++
++  s = s.replace(/\n{3,}/g, "\n\n").trim() + "\n";
++  return s;
++}
++
++
+ /**
+  * Repair common AI-generated Next.js App Router breakages that cause `next dev` to exit instantly.
+  * This does NOT try to be perfect; it only fixes very specific, clearly-wrong patterns.
+  */
+ async function repairProjectForPreview(inst: Instance, projectPath: string): Promise<void> {
++  // 0) Next.js 14.x does NOT support next.config.ts. Migrate it so preview can start.
++  const nextConfigTs = path.join(projectPath, "next.config.ts");
++  const nextConfigMjs = path.join(projectPath, "next.config.mjs");
++  const nextConfigJs = path.join(projectPath, "next.config.js");
++
++  if (fileExists(nextConfigTs) && !fileExists(nextConfigMjs) && !fileExists(nextConfigJs)) {
++    pushLogLine(inst, "🛠 Repair: Migrating unsupported next.config.ts → next.config.mjs");
++    const ts = await readText(nextConfigTs);
++    const mjs = convertNextConfigTsToMjs(ts);
++    await writeText(nextConfigMjs, mjs);
++
++    // Rename the TS config out of the way so Next.js doesn't error.
++    try {
++      let bak = nextConfigTs + ".bak";
++      let n = 2;
++      while (fileExists(bak)) {
++        bak = nextConfigTs + ".bak" + n;
++        n += 1;
++      }
++      await fs.promises.rename(nextConfigTs, bak);
++    } catch {
++      // Last resort: try to delete it.
++      try { await fs.promises.unlink(nextConfigTs); } catch {}
++    }
++  }
++
+   const layoutCandidates = [
+     path.join(projectPath, "src/app/layout.tsx"),
+     path.join(projectPath, "app/layout.tsx"),

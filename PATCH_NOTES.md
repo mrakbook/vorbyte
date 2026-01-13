@@ -1,14 +1,24 @@
-# VorByte Preview Repair Patch
+# VorByte Patch: Fix pnpm @vercel/preact install error + Preview runner args bug
 
-Your preview isn't starting because the AI generated code that crashes Next dev immediately:
-- Invalid App Router layout using next/app / AppRouter
-- Wrong imports like `import { Button } from '@shadcn/ui'`
-- Installing @shadcn/ui, which is not a supported shadcn setup
+This patch fixes two runtime issues reported from VorByte Studio:
 
-This patch fixes preview reliability by:
-1) Repairing clearly-invalid layout.tsx before starting preview.
-2) Creating a minimal local `src/components/ui/button.tsx` if needed.
-3) Rewriting bad Button imports to `@/components/ui/button`.
-4) Keeping stronger error tail logs on exit.
+1) **ERR_PNPM_FETCH_404 @vercel/preact**
+   - The AI/codegen pipeline can sometimes suggest non-existent packages (e.g. `@vercel/preact`).
+   - Previously, a single bad dependency caused the whole `ai:run` to fail.
+   - **Fix:** `packages/codegen/src/apply.ts`
+     - Filters out `@vercel/preact` (including versioned forms like `@vercel/preact@latest`).
+     - Installs dependencies **best-effort**: if a batch install fails, it retries package-by-package and skips only the failing ones.
 
-It also includes a stricter dependency filter in codegen (apply.ts) in earlier patches.
+2) **Next.js preview fails with “Invalid project directory …/-p”**
+   - On some setups, running `pnpm dev -- -p <port> -H <host>` results in Next receiving a literal `--`,
+     which makes Next treat `-p` as a directory argument.
+   - **Fix:** `packages/preview/src/previewManager.ts`
+     - Prefer running the project’s local `node_modules/.bin/next dev -p <port> -H <host>` directly.
+     - Falls back to `pnpm dev` / `yarn dev` / `npm run dev` only if the project does not look like a Next app.
+
+## Files included
+- `packages/codegen/src/apply.ts`
+- `packages/preview/src/previewManager.ts`
+
+## How to apply
+Copy these files into your VorByte repo, preserving paths, then rebuild/restart VorByte Studio.

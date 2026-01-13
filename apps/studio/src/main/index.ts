@@ -25,6 +25,7 @@ import type {
 import { createAIEngine, type ChatMessage as EngineChatMessage } from '../../../../packages/engine/src/index'
 import { parseAiResponse, applyChanges } from '../../../../packages/codegen/src/index'
 import { createPreviewManager } from '../../../../packages/preview/src/index'
+import { ensureDesignBridge } from './design/ensureBridge'
 
 /**
  * Load .env (in dev, this will pick up apps/studio/.env).
@@ -984,6 +985,14 @@ ipcMain.handle('ai:cancel', async (_evt, requestId: string) => {
 
 // Milestone 3: Live Preview (Next.js dev server) IPC
 ipcMain.handle('preview:start', async (_evt, projectPath: string, opts?: { port?: number; autoInstallDeps?: boolean }) => {
+  // Ensure the project has the in-preview design bridge (route tracking, inspect mode, etc.)
+  // Best-effort: preview should still start even if bridge injection fails.
+  try {
+    await ensureDesignBridge(projectPath)
+  } catch {
+    // ignore
+  }
+
   return previewManager.start({
     projectPath,
     port: opts?.port,
@@ -1017,3 +1026,4 @@ ipcMain.handle('dialog:selectDirectory', async (_evt, opts?: { defaultPath?: str
   if (result.canceled) return null
   return result.filePaths[0] ?? null
 })
+

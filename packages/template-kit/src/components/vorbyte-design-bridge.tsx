@@ -1,276 +1,273 @@
-'use client'
+/* VorByteDesignBridge v2 */
+/**
+ * Runs inside the previewed Next.js app (in an iframe).
+ *
+ * Responsibilities:
+ * - Tell the parent (VorByte Studio) when the bridge is ready
+ * - Report the current route so the Studio can show a browser-like address bar
+ * - (Optional) Inspect mode: hover outline + click-to-select element metadata
+ * - Apply quick DOM edits for a smoother UX while source files are being rewritten
+ */
+"use client";
 
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from "react";
 
-type ParentMsg =
-  | { kind: 'vorbyte:design'; type: 'ping' }
-  | { kind: 'vorbyte:design'; type: 'enable'; enabled: boolean }
-  | {
-      kind: 'vorbyte:design'
-      type: 'apply'
-      selector: string
-      newText?: string
-      newClassName?: string
-    }
+type DesignSelection = {
+  selector: string;
+  tag: string;
+  text?: string;
+  className?: string;
+};
 
-type ChildMsg =
-  | { kind: 'vorbyte:design'; type: 'ready'; version: 1 }
-  | { kind: 'vorbyte:design'; type: 'pong' }
-  | { kind: 'vorbyte:design'; type: 'enabled'; enabled: boolean }
-  | {
-      kind: 'vorbyte:design'
-      type: 'selected'
-      selection: {
-        selector: string
-        tag: string
-        text?: string
-        className?: string
-      }
-    }
+type ParentMessage =
+  | { kind: "vorbyte:design"; type: "ping" }
+  | { kind: "vorbyte:design"; type: "enable"; enabled: boolean }
+  | { kind: "vorbyte:design"; type: "apply"; selector: string; newText?: string; newClassName?: string }
+  | { kind: "vorbyte:design"; type: "navigate"; route: string }
+  | { kind: "vorbyte:design"; type: "nav"; action: "back" | "forward" | "reload" };
 
-function postToParent(msg: ChildMsg) {
-  // In Electron Studio, the app sits in the parent frame.
-  window.parent?.postMessage(msg, '*')
+function cssEscape(value: string): string {
+  // Prefer the platform escape (widely supported in modern browsers).
+  const css = (globalThis as any).CSS;
+  if (css && typeof css.escape === "function") return css.escape(value);
+  // Fallback: escape quotes + backslashes (enough for our data-vb-id usage).
+  return value.replace(/["\\]/g, "\\$&");
 }
 
-function isElement(x: any): x is Element {
-  return !!x && typeof x === 'object' && x.nodeType === 1
-}
-
-function clamp(n: number, min: number, max: number) {
-  return Math.max(min, Math.min(max, n))
-}
-
-function updateOverlayBox(overlay: HTMLDivElement, el: Element | null) {
-  if (!el) {
-    overlay.style.display = 'none'
-    return
+function ensureVbId(el: HTMLElement): string {
+  if (!el.dataset.vbId) {
+    el.dataset.vbId = "vb_" + Math.random().toString(16).slice(2) + Date.now().toString(16);
   }
-
-  const rect = el.getBoundingClientRect()
-
-  // If element is offscreen / tiny, still draw but clamp.
-  const left = clamp(rect.left, 0, window.innerWidth)
-  const top = clamp(rect.top, 0, window.innerHeight)
-  const width = clamp(rect.width, 0, window.innerWidth)
-  const height = clamp(rect.height, 0, window.innerHeight)
-
-  overlay.style.display = 'block'
-  overlay.style.left = `${left}px`
-  overlay.style.top = `${top}px`
-  overlay.style.width = `${width}px`
-  overlay.style.height = `${height}px`
+  return el.dataset.vbId;
 }
 
-function cssEscape(value: string) {
-  // CSS.escape is not available in all environments; implement a minimal fallback.
-  // This is not perfect but works for typical ids/classes.
-  // https://developer.mozilla.org/en-US/docs/Web/API/CSS/escape
-  if (typeof (window as any).CSS?.escape === 'function') return (window as any).CSS.escape(value)
-  return value.replace(/[^a-zA-Z0-9_-]/g, (ch) => `\\${ch}`)
+function selectionFromElement(el: HTMLElement): DesignSelection {
+  const id = ensureVbId(el);
+  const selector = `[data-vb-id="${cssEscape(id)}"]`;
+  const text = (el.innerText || el.textContent || "").trim();
+  const className = (el.getAttribute("class") || "").trim();
+  return {
+    selector,
+    tag: el.tagName.toLowerCase(),
+    text: text.length > 400 ? text.slice(0, 399) + "…" : text,
+    className,
+  };
 }
 
-function nthOfTypeSelector(el: Element): string {
-  const tag = el.tagName.toLowerCase()
-  const parent = el.parentElement
-  if (!parent) return tag
-
-  const siblings = Array.from(parent.children).filter(
-    (c) => (c as Element).tagName.toLowerCase() === tag
-  )
-  if (siblings.length <= 1) return tag
-
-  const idx = siblings.indexOf(el)
-  return `${tag}:nth-of-type(${idx + 1})`
-}
-
-function buildUniqueSelector(el: Element): string {
-  const id = (el as HTMLElement).id
-  if (id) return `#${cssEscape(id)}`
-
-  const parts: string[] = []
-  let cur: Element | null = el
-  let safety = 0
-
-  while (cur && safety++ < 25) {
-    const tagPart = nthOfTypeSelector(cur)
-    parts.unshift(tagPart)
-    if (cur.parentElement?.tagName.toLowerCase() === 'body') break
-    cur = cur.parentElement
+function postToParent(msg: any) {
+  try {
+    window.parent?.postMessage(msg, "*");
+  } catch {
+    // ignore
   }
-
-  return parts.length ? `body > ${parts.join(' > ')}` : 'body'
 }
 
-function bestEffortText(el: Element): string | undefined {
-  const h = el as HTMLElement
-  if (!h) return undefined
-
-  // Prefer innerText so it matches what the user sees (ignores hidden text).
-  const t = (h.innerText ?? '').trim()
-  if (!t) return undefined
-
-  // Keep this short; it is used as a matching hint for code edits.
-  return t.slice(0, 500)
+function currentRoute(): string {
+  return window.location.pathname + window.location.search + window.location.hash;
 }
 
 export default function VorByteDesignBridge() {
-  const enabledRef = useRef(false)
+  const [enabled, setEnabled] = useState(false);
 
-  const hoverElRef = useRef<Element | null>(null)
-  const selectedElRef = useRef<Element | null>(null)
-  const selectedSelectorRef = useRef<string | null>(null)
+  const hoverBoxRef = useRef<HTMLDivElement | null>(null);
+  const selectBoxRef = useRef<HTMLDivElement | null>(null);
 
-  const hoverOverlayRef = useRef<HTMLDivElement | null>(null)
-  const selectedOverlayRef = useRef<HTMLDivElement | null>(null)
+  function updateBox(box: HTMLDivElement, el: HTMLElement) {
+    const r = el.getBoundingClientRect();
+    box.style.display = "block";
+    box.style.left = r.left + "px";
+    box.style.top = r.top + "px";
+    box.style.width = r.width + "px";
+    box.style.height = r.height + "px";
+  }
 
+  function notifyRoute() {
+    postToParent({ kind: "vorbyte:design", type: "route", route: currentRoute() });
+  }
+
+  // Boot + keep the parent informed of route changes.
   useEffect(() => {
-    // Hover overlay
-    const hover = document.createElement('div')
-    hover.dataset.vorbyteOverlay = 'hover'
-    hover.style.position = 'fixed'
-    hover.style.pointerEvents = 'none'
-    hover.style.zIndex = '2147483647'
-    hover.style.border = '2px solid rgba(59,130,246,0.9)'
-    hover.style.background = 'rgba(59,130,246,0.08)'
-    hover.style.boxSizing = 'border-box'
-    hover.style.display = 'none'
-    document.body.appendChild(hover)
-    hoverOverlayRef.current = hover
+    postToParent({ kind: "vorbyte:design", type: "ready" });
+    notifyRoute();
 
-    // Selected overlay
-    const selected = document.createElement('div')
-    selected.dataset.vorbyteOverlay = 'selected'
-    selected.style.position = 'fixed'
-    selected.style.pointerEvents = 'none'
-    selected.style.zIndex = '2147483647'
-    selected.style.border = '2px solid rgba(16,185,129,0.95)'
-    selected.style.background = 'rgba(16,185,129,0.06)'
-    selected.style.boxSizing = 'border-box'
-    selected.style.display = 'none'
-    document.body.appendChild(selected)
-    selectedOverlayRef.current = selected
+    // Monkey-patch history so SPA navigations still report routes.
+    const origPush = history.pushState;
+    const origReplace = history.replaceState;
 
-    const refreshOverlays = () => {
-      updateOverlayBox(hover, hoverElRef.current)
-      updateOverlayBox(selected, selectedElRef.current)
+    function wrap(fn: typeof history.pushState) {
+      return function (this: any, ...args: any[]) {
+        const res = fn.apply(this, args as any);
+        // defer to let router finish updating location
+        setTimeout(notifyRoute, 0);
+        return res;
+      } as any;
     }
 
-    const pickTarget = (raw: any): Element | null => {
-      if (!isElement(raw)) return null
-      const el = raw as Element
-
-      // Avoid selecting our own overlays (should be impossible due to pointer-events:none, but be safe).
-      if ((el as HTMLElement).dataset?.vorbyteOverlay) return null
-
-      return el
+    try {
+      history.pushState = wrap(origPush);
+      history.replaceState = wrap(origReplace);
+    } catch {
+      // ignore if read-only
     }
 
-    const onMove = (e: MouseEvent) => {
-      if (!enabledRef.current) return
-      const el = pickTarget(e.target)
-      hoverElRef.current = el
-      updateOverlayBox(hover, el)
-    }
-
-    const onClick = (e: MouseEvent) => {
-      if (!enabledRef.current) return
-      const el = pickTarget(e.target)
-      if (!el) return
-
-      // Prevent navigation (links) or other clicks while in inspect mode.
-      e.preventDefault()
-      e.stopPropagation()
-
-      selectedElRef.current = el
-      const selector = buildUniqueSelector(el)
-      selectedSelectorRef.current = selector
-
-      updateOverlayBox(selected, el)
-
-      const selection = {
-        selector,
-        tag: el.tagName.toLowerCase(),
-        text: bestEffortText(el),
-        className: (el as HTMLElement).className || undefined
-      }
-
-      postToParent({ kind: 'vorbyte:design', type: 'selected', selection })
-    }
-
-    const onScrollOrResize = () => {
-      if (!enabledRef.current && !selectedElRef.current) return
-      refreshOverlays()
-    }
-
-    const onMessage = (ev: MessageEvent) => {
-      const data = ev.data as any
-      if (!data || typeof data !== 'object') return
-      if (data.kind !== 'vorbyte:design') return
-
-      const msg = data as ParentMsg
-
-      if (msg.type === 'ping') {
-        postToParent({ kind: 'vorbyte:design', type: 'pong' })
-        return
-      }
-
-      if (msg.type === 'enable') {
-        enabledRef.current = !!msg.enabled
-        if (!enabledRef.current) {
-          hoverElRef.current = null
-          updateOverlayBox(hover, null)
-        }
-        postToParent({ kind: 'vorbyte:design', type: 'enabled', enabled: enabledRef.current })
-        return
-      }
-
-      if (msg.type === 'apply') {
-        const { selector, newText, newClassName } = msg
-        const el = document.querySelector(selector)
-        if (!el) return
-
-        if (typeof newText === 'string') {
-          // For inputs, update value; otherwise update text content.
-          if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
-            el.value = newText
-          } else {
-            el.textContent = newText
-          }
-        }
-
-        if (typeof newClassName === 'string') {
-          ;(el as HTMLElement).className = newClassName
-        }
-
-        // Keep overlays aligned
-        if (selectedSelectorRef.current === selector) {
-          selectedElRef.current = el
-          refreshOverlays()
-        }
-      }
-    }
-
-    window.addEventListener('mousemove', onMove, true)
-    window.addEventListener('click', onClick, true)
-    window.addEventListener('scroll', onScrollOrResize, true)
-    window.addEventListener('resize', onScrollOrResize)
-    window.addEventListener('message', onMessage)
-
-    // Signal readiness to the parent Studio UI.
-    postToParent({ kind: 'vorbyte:design', type: 'ready', version: 1 })
+    window.addEventListener("popstate", notifyRoute);
+    window.addEventListener("hashchange", notifyRoute);
 
     return () => {
-      window.removeEventListener('mousemove', onMove, true)
-      window.removeEventListener('click', onClick, true)
-      window.removeEventListener('scroll', onScrollOrResize, true)
-      window.removeEventListener('resize', onScrollOrResize)
-      window.removeEventListener('message', onMessage)
+      try {
+        history.pushState = origPush;
+        history.replaceState = origReplace;
+      } catch {
+        // ignore
+      }
+      window.removeEventListener("popstate", notifyRoute);
+      window.removeEventListener("hashchange", notifyRoute);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
-      hover.remove()
-      selected.remove()
+  // Message handling from Studio.
+  useEffect(() => {
+    function onMessage(e: MessageEvent) {
+      const data = e.data as ParentMessage | any;
+      if (!data || typeof data !== "object") return;
+      if (data.kind !== "vorbyte:design") return;
+
+      if (data.type === "ping") {
+        postToParent({ kind: "vorbyte:design", type: "pong" });
+        notifyRoute();
+        return;
+      }
+
+      if (data.type === "enable") {
+        setEnabled(!!data.enabled);
+        return;
+      }
+
+      if (data.type === "apply") {
+        const selector = typeof data.selector === "string" ? data.selector : null;
+        if (!selector) return;
+        const el = document.querySelector(selector) as HTMLElement | null;
+        if (!el) return;
+
+        if (typeof data.newText === "string") {
+          el.innerText = data.newText;
+        }
+        if (typeof data.newClassName === "string") {
+          el.setAttribute("class", data.newClassName);
+        }
+        return;
+      }
+
+      if (data.type === "navigate") {
+        const route = typeof data.route === "string" ? data.route : "/";
+        try {
+          // Allow either a path (/about) or a full URL.
+          if (route.startsWith("http://") || route.startsWith("https://") || route.startsWith("//")) {
+            window.location.assign(route);
+          } else {
+            const raw = route.trim() || "/";
+            const next = raw.startsWith("/") ? raw : `/${raw}`;
+            window.location.assign(next);
+          }
+        } catch {
+          // ignore
+        }
+        return;
+      }
+
+      if (data.type === "nav") {
+        const action = data.action;
+        try {
+          if (action === "back") history.back();
+          if (action === "forward") history.forward();
+          if (action === "reload") window.location.reload();
+        } catch {
+          // ignore
+        }
+        return;
+      }
     }
-  }, [])
 
-  return null
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Create overlays once.
+  useEffect(() => {
+    if (!hoverBoxRef.current) {
+      const d = document.createElement("div");
+      d.style.position = "fixed";
+      d.style.zIndex = "2147483647";
+      d.style.pointerEvents = "none";
+      d.style.border = "2px solid rgba(59,130,246,0.9)";
+      d.style.background = "rgba(59,130,246,0.08)";
+      d.style.display = "none";
+      document.body.appendChild(d);
+      hoverBoxRef.current = d;
+    }
+    if (!selectBoxRef.current) {
+      const d = document.createElement("div");
+      d.style.position = "fixed";
+      d.style.zIndex = "2147483647";
+      d.style.pointerEvents = "none";
+      d.style.border = "2px solid rgba(34,197,94,0.95)";
+      d.style.background = "rgba(34,197,94,0.06)";
+      d.style.display = "none";
+      document.body.appendChild(d);
+      selectBoxRef.current = d;
+    }
+  }, []);
+
+  // Inspect mode listeners.
+  useEffect(() => {
+    if (!enabled) {
+      if (hoverBoxRef.current) hoverBoxRef.current.style.display = "none";
+      return;
+    }
+
+    function onMove(e: MouseEvent) {
+      if (!enabled) return;
+      const target = e.target as HTMLElement | null;
+      if (!target) return;
+
+      if (target === hoverBoxRef.current || target === selectBoxRef.current) return;
+      if (target.closest("[data-vb-ignore]")) return;
+
+      const box = hoverBoxRef.current;
+      if (!box) return;
+      updateBox(box, target);
+    }
+
+    function onClick(e: MouseEvent) {
+      if (!enabled) return;
+
+      // While inspect is enabled, prevent navigation and let the user select.
+      e.preventDefault();
+      e.stopPropagation();
+
+      const target = e.target as HTMLElement | null;
+      if (!target) return;
+      if (target === hoverBoxRef.current || target === selectBoxRef.current) return;
+      if (target.closest("[data-vb-ignore]")) return;
+
+      const selection = selectionFromElement(target);
+
+      // lock selection outline
+      if (selectBoxRef.current) updateBox(selectBoxRef.current, target);
+
+      postToParent({ kind: "vorbyte:design", type: "selected", selection });
+    }
+
+    window.addEventListener("mousemove", onMove, true);
+    window.addEventListener("click", onClick, true);
+
+    return () => {
+      window.removeEventListener("mousemove", onMove, true);
+      window.removeEventListener("click", onClick, true);
+    };
+  }, [enabled]);
+
+  return null;
 }

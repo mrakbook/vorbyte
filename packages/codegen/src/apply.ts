@@ -57,6 +57,50 @@ function splitDevDeps(deps: string[]): { prod: string[]; dev: string[] } {
   return { prod, dev };
 }
 
+async function installBestEffort(opts: {
+  cmd: string;
+  argsForPkgs: (pkgs: string[]) => string[];
+  cwd: string;
+  pkgs: string[];
+  label?: string;
+}): Promise<{ installed: string[]; skipped: string[] }> {
+  const pkgs = opts.pkgs.filter(Boolean);
+  if (pkgs.length === 0) return { installed: [], skipped: [] };
+
+  try {
+    await run(opts.cmd, opts.argsForPkgs(pkgs), opts.cwd);
+    return { installed: pkgs, skipped: [] };
+  } catch (bulkErr) {
+    // If a batch install fails (often due to one invalid package), try each package individually.
+    const installed: string[] = [];
+    const skipped: string[] = [];
+
+    for (const pkg of pkgs) {
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        await run(opts.cmd, opts.argsForPkgs([pkg]), opts.cwd);
+        installed.push(pkg);
+      } catch {
+        skipped.push(pkg);
+      }
+    }
+
+    // If nothing installed, rethrow the original error (likely network / auth / registry issues).
+    if (installed.length === 0) throw bulkErr;
+
+    if (skipped.length) {
+      // Best-effort: keep going, but make the failure visible in logs.
+      // (This is common when the AI suggests a non-existent package.)
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[vorbyte/codegen] Skipped failed dependencies (${opts.label ?? "deps"}): ${skipped.join(", ")}`
+      );
+    }
+
+    return { installed, skipped };
+  }
+}
+
 /**
  * Filter invalid / harmful dependencies before running installs.
  * This prevents:
@@ -84,6 +128,9 @@ function filterInvalidDeps(deps: string[]): string[] {
     "shadcn",
     "ui",
     "@shadcn/ui",
+
+    // Known non-existent / hallucinated packages
+    "@vercel/preact",
 
     // Next import paths commonly mistaken as deps
     "next/link",
@@ -117,6 +164,9 @@ function filterInvalidDeps(deps: string[]): string[] {
 
     if (denyExact.has(name)) continue;
 
+    // Non-existent package sometimes suggested by the AI. Skip it (including versioned forms).
+    if (name === "@vercel/preact" || name.startsWith("@vercel/preact@")) continue;
+
     // If it looks like an import path (has "/") and it's not a scoped package (@scope/pkg),
     // treat it as invalid for installation.
     if (name.includes("/") && !name.startsWith("@")) {
@@ -146,28 +196,78 @@ async function installDeps(projectDir: string, deps: string[]): Promise<string[]
   const hasNpm = await cmdOk("npm");
   const hasYarn = await cmdOk("yarn");
 
+  const installedAll: string[] = [];
+
   if (hasPnpm) {
-    // Always install into project dir explicitly, bypass workspace root check
+    // Always install into project dir explicitly, bypass workspace root check.
+    // Best-effort: if one package fails (e.g. 404), install the rest and skip the bad one.
     const flags = ["--dir", projectDir, "--ignore-workspace-root-check"];
-    if (prod.length) await run("pnpm", ["add", ...prod, ...flags], projectDir);
-    if (dev.length) await run("pnpm", ["add", "-D", ...dev, ...flags], projectDir);
-    return needed;
+
+    const prodRes = await installBestEffort({
+      cmd: "pnpm",
+      cwd: projectDir,
+      pkgs: prod,
+      label: "prod",
+      argsForPkgs: (pkgs) => ["add", ...pkgs, ...flags],
+    });
+
+    const devRes = await installBestEffort({
+      cmd: "pnpm",
+      cwd: projectDir,
+      pkgs: dev,
+      label: "dev",
+      argsForPkgs: (pkgs) => ["add", "-D", ...pkgs, ...flags],
+    });
+
+    installedAll.push(...prodRes.installed, ...devRes.installed);
+    return installedAll;
   }
 
   if (hasYarn) {
-    if (prod.length) await run("yarn", ["add", ...prod], projectDir);
-    if (dev.length) await run("yarn", ["add", "-D", ...dev], projectDir);
-    return needed;
+    const prodRes = await installBestEffort({
+      cmd: "yarn",
+      cwd: projectDir,
+      pkgs: prod,
+      label: "prod",
+      argsForPkgs: (pkgs) => ["add", ...pkgs],
+    });
+
+    const devRes = await installBestEffort({
+      cmd: "yarn",
+      cwd: projectDir,
+      pkgs: dev,
+      label: "dev",
+      argsForPkgs: (pkgs) => ["add", "-D", ...pkgs],
+    });
+
+    installedAll.push(...prodRes.installed, ...devRes.installed);
+    return installedAll;
   }
 
   if (!hasNpm) {
     throw new Error("No package manager found (need pnpm, yarn, or npm).");
   }
 
-  if (prod.length) await run("npm", ["install", ...prod], projectDir);
-  if (dev.length) await run("npm", ["install", "-D", ...dev], projectDir);
-  return needed;
+  const prodRes = await installBestEffort({
+    cmd: "npm",
+    cwd: projectDir,
+    pkgs: prod,
+    label: "prod",
+    argsForPkgs: (pkgs) => ["install", ...pkgs],
+  });
+
+  const devRes = await installBestEffort({
+    cmd: "npm",
+    cwd: projectDir,
+    pkgs: dev,
+    label: "dev",
+    argsForPkgs: (pkgs) => ["install", "-D", ...pkgs],
+  });
+
+  installedAll.push(...prodRes.installed, ...devRes.installed);
+  return installedAll;
 }
+
 
 export async function applyChanges(opts: { projectDir: string; files: FileChange[]; dependencies?: string[] }): Promise<ApplyResult> {
   const writtenFiles: string[] = [];

@@ -433,12 +433,22 @@ export default function App() {
   const [mode, setMode] = useState<'chat' | 'design'>('chat')
 
   // Milestone 3: Live preview state
+  // - previewRoute: the current (browser-like) location shown in the address bar
+  // - previewFrameRoute: the route used to (re)load the iframe when we do a hard refresh
+  //   (we intentionally do NOT bind the iframe src to previewRoute, otherwise in-preview navigation
+  //    would cause unnecessary reloads).
   const [previewRoute, setPreviewRoute] = useState<string>('/')
+  const [previewFrameRoute, setPreviewFrameRoute] = useState<string>('/')
   const [previewFrameNonce, setPreviewFrameNonce] = useState(0)
   const [previewStatus, setPreviewStatus] = useState<PreviewStatus | null>(null)
   const [previewLogs, setPreviewLogs] = useState<string[]>([])
   const [previewStarting, setPreviewStarting] = useState(false)
   const lastProjectPathRef = useRef<string | null>(null)
+
+  // Discovered routes/pages for the "complete preview" navigator (v0-style).
+  const [previewRoutes, setPreviewRoutes] = useState<string[]>(['/'])
+  const [previewRoutesLoading, setPreviewRoutesLoading] = useState(false)
+  const [previewRoutesQuery, setPreviewRoutesQuery] = useState('')
 
 // Milestone 4: WYSIWYG selection/edit state (best-effort v1)
 const previewIframeRef = useRef<HTMLIFrameElement | null>(null)
@@ -455,10 +465,17 @@ const [designApplyError, setDesignApplyError] = useState<string | null>(null)
     const base = previewStatus.url
     if (!base) return null
     const cleanBase = base.replace(/\/$/, '')
-    const routeRaw = previewRoute || '/'
+    const routeRaw = (previewFrameRoute || '/').trim() || '/'
     const route = routeRaw.startsWith('/') ? routeRaw : `/${routeRaw}`
     return `${cleanBase}${route === '/' ? '/' : route}`
-  }, [previewStatus?.state, previewStatus?.url, previewRoute])
+  }, [previewStatus?.state, previewStatus?.url, previewFrameRoute])
+
+  const filteredPreviewRoutes = useMemo(() => {
+    const q = previewRoutesQuery.trim().toLowerCase()
+    if (!q) return previewRoutes
+    return previewRoutes.filter((r) => r.toLowerCase().includes(q))
+  }, [previewRoutes, previewRoutesQuery])
+
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [draft, setDraft] = useState('')
 
@@ -582,6 +599,12 @@ const [designApplyError, setDesignApplyError] = useState<string | null>(null)
   }, [activeProject])
 
   useEffect(() => {
+    if (!activeProject) return
+    void refreshPreviewRoutes(activeProject.path)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeProject?.path])
+
+  useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages.length])
 
@@ -600,6 +623,8 @@ const [designApplyError, setDesignApplyError] = useState<string | null>(null)
       setPreviewStatus(null)
       setPreviewLogs([])
       setPreviewRoute('/')
+      setPreviewFrameRoute('/')
+      setPreviewRoutes(['/'])
       setPreviewFrameNonce((n) => n + 1)
     }
 
@@ -702,7 +727,17 @@ const [designApplyError, setDesignApplyError] = useState<string | null>(null)
       setMessages(res.chat)
       const t = await window.api.fs.tree(activeProject.path, { maxDepth: 6 })
       setTree(t)
-      if (mode === 'design') setPreviewFrameNonce((n) => n + 1)
+
+      // Keep the route navigator up to date (new pages/routes may have been created by the AI).
+      void refreshPreviewRoutes(activeProject.path)
+
+      // If we're in Design mode, hard-reload the iframe on the *current* route.
+      if (mode === 'design') {
+        const raw = (previewRoute || '/').trim() || '/'
+        const route = raw.startsWith('/') ? raw : `/${raw}`
+        setPreviewFrameRoute(route)
+        setPreviewFrameNonce((n) => n + 1)
+      }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
       setMessages((m) => m.map((x) => (x.id === pendingId ? { ...x, content: `⚠️ ${msg}` } : x)))
@@ -727,6 +762,7 @@ const [designApplyError, setDesignApplyError] = useState<string | null>(null)
     setTree(null)
     setMessages([])
     setPreviewRoute('/')
+    setPreviewFrameRoute('/')
     setMode('chat')
 
     // Stop preview in the background.
@@ -778,11 +814,51 @@ const [designApplyError, setDesignApplyError] = useState<string | null>(null)
       // index => folder route
       if (last === 'index') segments.pop()
 
+      // Ignore API routes (pages/api/*)
+      if ((segments[0] ?? '').toLowerCase() === 'api') return null
+
       const route = '/' + segments.join('/')
       return route === '/' ? '/' : route
     }
 
     return null
+  }
+
+
+  function collectRoutesFromTree(node: FileTreeNode | null, out: Set<string>) {
+    if (!node) return
+    if (node.type === 'file') {
+      const route = guessRouteFromFilePath(node.path)
+      if (route) out.add(route)
+      return
+    }
+    for (const child of node.children ?? []) {
+      collectRoutesFromTree(child, out)
+    }
+  }
+
+  async function refreshPreviewRoutes(projectPath: string) {
+    setPreviewRoutesLoading(true)
+    try {
+      // Use a deeper tree so we reliably find all pages/routes (v0-style complete preview).
+      const deep = await window.api.fs.tree(projectPath, { maxDepth: 25 })
+      const set = new Set<string>()
+      collectRoutesFromTree(deep, set)
+      set.add('/') // always include home
+
+      const arr = Array.from(set)
+      arr.sort((a, b) => {
+        if (a === '/' && b !== '/') return -1
+        if (b === '/' && a !== '/') return 1
+        return a.localeCompare(b)
+      })
+
+      setPreviewRoutes(arr)
+    } catch {
+      setPreviewRoutes(['/'])
+    } finally {
+      setPreviewRoutesLoading(false)
+    }
   }
 
   async function startPreview(forceRestart: boolean) {
@@ -808,6 +884,10 @@ const [designApplyError, setDesignApplyError] = useState<string | null>(null)
       setPreviewLogs(logs)
 
       // Force-refresh the embedded frame (useful after restarts).
+      // Reload on the currently shown route (browser-like address bar).
+      const raw = (previewRoute || '/').trim() || '/'
+      const route = raw.startsWith('/') ? raw : `/${raw}`
+      setPreviewFrameRoute(route)
       setPreviewFrameNonce((n) => n + 1)
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
@@ -837,6 +917,10 @@ const [designApplyError, setDesignApplyError] = useState<string | null>(null)
       const logs = await window.api.preview.logs(projectPath, { tail: 250 })
       setPreviewLogs(logs)
 
+      // Hard-refresh the iframe on the currently shown route (browser-like address bar).
+      const raw = (previewRoute || '/').trim() || '/'
+      const route = raw.startsWith('/') ? raw : `/${raw}`
+      setPreviewFrameRoute(route)
       setPreviewFrameNonce((n) => n + 1)
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
@@ -876,6 +960,14 @@ useEffect(() => {
       if (sel) setDesignSelection(sel)
       return
     }
+
+    if (data.type === 'route') {
+      const r = typeof data.route === 'string' ? data.route : '/'
+      const raw = r.trim() || '/'
+      const route = raw.startsWith('/') ? raw : `/${raw}`
+      setPreviewRoute(route)
+      return
+    }
   }
 
   window.addEventListener('message', onMessage)
@@ -903,7 +995,7 @@ const applyDesignChanges = async () => {
 
   const req: DesignApplyRequest = {
     projectPath: activeProject.path,
-    route: previewRoute || '/',
+    route: (previewRoute || '/').split(/[?#]/)[0] || '/',
     selector: designSelection.selector,
     originalText: designSelection.text,
     newText: designTextDraft,
@@ -927,6 +1019,10 @@ const applyDesignChanges = async () => {
     })
 
     // Fallback reload: some changes can require a refresh.
+    // Reload on the currently shown route (browser-like address bar).
+    const raw = (previewRoute || '/').trim() || '/'
+    const route = raw.startsWith('/') ? raw : `/${raw}`
+    setPreviewFrameRoute(route)
     setPreviewFrameNonce((n) => n + 1)
   } catch (err) {
     setDesignApplyError(err instanceof Error ? err.message : String(err))
@@ -1006,6 +1102,7 @@ const applyDesignChanges = async () => {
                 const route = guessRouteFromFilePath(filePath)
                 if (route) {
                   setPreviewRoute(route)
+                  setPreviewFrameRoute(route)
                   setMode('design')
                   setPreviewFrameNonce((n) => n + 1)
                   void startPreview(false)
@@ -1065,20 +1162,79 @@ const applyDesignChanges = async () => {
                 </div>
 
                 <div className="ml-auto flex items-center gap-2">
+                  <button
+                    className="rounded border border-zinc-200 bg-white px-2 py-1 text-xs hover:bg-zinc-50 disabled:opacity-50"
+                    onClick={() => postToPreview({ kind: 'vorbyte:design', type: 'nav', action: 'back' })}
+                    disabled={!previewSrc}
+                    title="Back"
+                  >
+                    ←
+                  </button>
+                  <button
+                    className="rounded border border-zinc-200 bg-white px-2 py-1 text-xs hover:bg-zinc-50 disabled:opacity-50"
+                    onClick={() => postToPreview({ kind: 'vorbyte:design', type: 'nav', action: 'forward' })}
+                    disabled={!previewSrc}
+                    title="Forward"
+                  >
+                    →
+                  </button>
+                  <button
+                    className="rounded border border-zinc-200 bg-white px-2 py-1 text-xs hover:bg-zinc-50 disabled:opacity-50"
+                    onClick={() => {
+                      setPreviewRoute('/')
+                      setPreviewFrameRoute('/')
+                      setPreviewFrameNonce((n) => n + 1)
+                    }}
+                    disabled={!activeProject}
+                    title="Home"
+                  >
+                    Home
+                  </button>
+
                   <input
                     value={previewRoute}
                     onChange={(e) => setPreviewRoute(e.target.value)}
-                    className="w-48 rounded border border-zinc-200 bg-white px-2 py-1 text-xs"
+                    onKeyDown={(e) => {
+                      if (e.key !== 'Enter') return
+                      e.preventDefault()
+                      const raw = (e.currentTarget.value || '/').trim() || '/'
+                      const route = raw.startsWith('/') ? raw : `/${raw}`
+                      setPreviewRoute(route)
+                      setPreviewFrameRoute(route)
+                      setPreviewFrameNonce((n) => n + 1)
+                    }}
+                    className="w-56 rounded border border-zinc-200 bg-white px-2 py-1 text-xs"
                     placeholder="/"
                   />
                   <button
                     className="rounded border border-zinc-200 bg-white px-2 py-1 text-xs hover:bg-zinc-50 disabled:opacity-50"
-                    onClick={() => setPreviewFrameNonce((n) => n + 1)}
+                    onClick={() => {
+                      const raw = (previewRoute || '/').trim() || '/'
+                      const route = raw.startsWith('/') ? raw : `/${raw}`
+                      setPreviewRoute(route)
+                      setPreviewFrameRoute(route)
+                      setPreviewFrameNonce((n) => n + 1)
+                    }}
+                    disabled={!activeProject}
+                    title="Go"
+                  >
+                    Go
+                  </button>
+
+                  <button
+                    className="rounded border border-zinc-200 bg-white px-2 py-1 text-xs hover:bg-zinc-50 disabled:opacity-50"
+                    onClick={() => {
+                      const raw = (previewRoute || '/').trim() || '/'
+                      const route = raw.startsWith('/') ? raw : `/${raw}`
+                      setPreviewFrameRoute(route)
+                      setPreviewFrameNonce((n) => n + 1)
+                    }}
                     disabled={!previewSrc}
-                    title="Reload iframe"
+                    title="Hard reload (iframe)"
                   >
                     Reload
                   </button>
+
                   <button
                     className="rounded border border-zinc-200 bg-white px-2 py-1 text-xs hover:bg-zinc-50 disabled:opacity-50"
                     onClick={() => startPreview(true)}
@@ -1087,27 +1243,29 @@ const applyDesignChanges = async () => {
                   >
                     {previewStarting ? 'Starting…' : 'Restart'}
                   </button>
-<button
-  className={`rounded border px-2 py-1 text-sm ${
-    designInspectEnabled ? 'bg-blue-600 text-white' : 'bg-white'
-  }`}
-  onClick={() => {
-    const next = !designInspectEnabled
-    setDesignInspectEnabled(next)
-    postToPreview({ kind: 'vorbyte:design', type: 'enable', enabled: next })
-    if (!next) setDesignSelection(null)
-  }}
-  disabled={!activeProject || !previewSrc}
-  title="Toggle element selection in the preview"
->
-  {designInspectEnabled ? 'Inspect: ON' : 'Inspect'}
-</button>
 
-{!designBridgeReady && activeProject ? (
-  <span className="text-xs text-zinc-500" title="Design bridge not detected yet">
-    (bridge not detected)
-  </span>
-) : null}
+                  <button
+                    className={`rounded border px-2 py-1 text-sm ${
+                      designInspectEnabled ? 'bg-blue-600 text-white' : 'bg-white'
+                    }`}
+                    onClick={() => {
+                      const next = !designInspectEnabled
+                      setDesignInspectEnabled(next)
+                      postToPreview({ kind: 'vorbyte:design', type: 'enable', enabled: next })
+                      if (!next) setDesignSelection(null)
+                    }}
+                    disabled={!activeProject || !previewSrc}
+                    title="Toggle element selection in the preview"
+                  >
+                    {designInspectEnabled ? 'Inspect: ON' : 'Inspect'}
+                  </button>
+
+                  {!designBridgeReady && activeProject ? (
+                    <span className="text-xs text-zinc-500" title="Design bridge not detected yet">
+                      (bridge not detected)
+                    </span>
+                  ) : null}
+
                   <button
                     className="rounded border border-zinc-200 bg-white px-2 py-1 text-xs hover:bg-zinc-50 disabled:opacity-50"
                     onClick={() => stopPreview()}
@@ -1120,7 +1278,71 @@ const applyDesignChanges = async () => {
               </div>
 
               <div className="flex flex-1 flex-col gap-2 p-3">
-                <div className="relative flex-1 overflow-hidden rounded border border-zinc-200 bg-white">
+                <div className="flex flex-1 gap-2">
+                  <div className="w-64 shrink-0 overflow-hidden rounded border border-zinc-200 bg-white">
+                    <div className="flex h-full flex-col">
+                      <div className="flex items-center justify-between border-b px-3 py-2">
+                        <div className="text-xs font-semibold text-zinc-700">Pages</div>
+                        <div className="flex items-center gap-2">
+                          <span className="text-[11px] text-zinc-500">
+                            {previewRoutesLoading ? 'Scanning…' : `${previewRoutes.length}`}
+                          </span>
+                          <button
+                            className="rounded border border-zinc-200 bg-white px-2 py-0.5 text-[11px] hover:bg-zinc-50 disabled:opacity-50"
+                            onClick={() => activeProject && refreshPreviewRoutes(activeProject.path)}
+                            disabled={!activeProject || previewRoutesLoading}
+                            title="Rescan routes"
+                          >
+                            ↻
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="p-2">
+                        <input
+                          value={previewRoutesQuery}
+                          onChange={(e) => setPreviewRoutesQuery(e.target.value)}
+                          className="w-full rounded border border-zinc-200 bg-white px-2 py-1 text-xs"
+                          placeholder="Filter…"
+                        />
+                      </div>
+
+                      <div className="flex-1 overflow-auto px-1 pb-2">
+                        {filteredPreviewRoutes.length === 0 ? (
+                          <div className="px-2 py-3 text-xs text-zinc-500">No matching pages.</div>
+                        ) : (
+                          filteredPreviewRoutes.map((r) => {
+                            const activePath = (previewRoute || '/').split(/[?#]/)[0] || '/'
+                            const isActive = activePath === r
+                            const isDynamic = r.includes('[') || r.includes(']')
+                            return (
+                              <button
+                                key={r}
+                                className={`flex w-full items-center gap-2 rounded px-2 py-1 text-left text-xs ${
+                                  isActive ? 'bg-zinc-100' : 'hover:bg-zinc-50'
+                                }`}
+                                onClick={() => {
+                                  setPreviewRoute(r)
+                                  setPreviewFrameRoute(r)
+                                  setPreviewFrameNonce((n) => n + 1)
+                                }}
+                                title={isDynamic ? 'Dynamic route (may need params)' : r}
+                              >
+                                <span className="font-mono">{r}</span>
+                                {isDynamic ? (
+                                  <span className="ml-auto rounded bg-zinc-100 px-1.5 py-0.5 text-[10px] text-zinc-600">
+                                    dynamic
+                                  </span>
+                                ) : null}
+                              </button>
+                            )
+                          })
+                        )}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="relative flex-1 overflow-hidden rounded border border-zinc-200 bg-white">
                   {!previewSrc ? (
                     <div className="flex h-full items-center justify-center p-6 text-sm text-zinc-600">
                       {previewStatus?.state === 'error' ? (
@@ -1241,6 +1463,7 @@ const applyDesignChanges = async () => {
   )}
 </div>
 
+                  </div>
                 </div>
 
                 <details className="rounded border border-zinc-200 bg-white">
