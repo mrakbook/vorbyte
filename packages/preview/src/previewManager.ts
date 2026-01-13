@@ -22,15 +22,12 @@ interface Instance {
   error?: string;
   proc?: ChildProcessWithoutNullStreams;
   logs: string[];
-  readyByLog?: Promise<void>;
-  readyByLogResolve?: (() => void) | null;
   exited?: boolean;
 }
 
-const MAX_LOG_LINES = 800;
+const MAX_LOG_LINES = 900;
 const DEFAULT_HOST = "127.0.0.1";
-const DEFAULT_READY_TIMEOUT_MS = 180_000; // 3 minutes
-const NODE_REQ_FOR_NEXT16 = { major: 20, minor: 9, patch: 0 };
+const DEFAULT_READY_TIMEOUT_MS = 180_000;
 
 function nowIso() {
   return new Date().toISOString();
@@ -48,20 +45,6 @@ function fileExists(p: string) {
 function pushLogLine(inst: Instance, line: string) {
   inst.logs.push(line);
   if (inst.logs.length > MAX_LOG_LINES) inst.logs.splice(0, inst.logs.length - MAX_LOG_LINES);
-
-  const lower = line.toLowerCase();
-  if (
-    lower.includes("ready") ||
-    lower.includes("started server") ||
-    lower.includes("listening on") ||
-    lower.includes("http://") ||
-    lower.includes("localhost")
-  ) {
-    if (inst.readyByLogResolve) {
-      inst.readyByLogResolve();
-      inst.readyByLogResolve = null;
-    }
-  }
 }
 
 function pushLogChunk(inst: Instance, chunk: Buffer) {
@@ -72,10 +55,7 @@ function pushLogChunk(inst: Instance, chunk: Buffer) {
 
 async function isCommandAvailable(cmd: string): Promise<boolean> {
   return await new Promise<boolean>((resolve) => {
-    const p = spawn(cmd, ["--version"], {
-      stdio: "ignore",
-      shell: process.platform === "win32",
-    });
+    const p = spawn(cmd, ["--version"], { stdio: "ignore", shell: process.platform === "win32" });
     p.once("error", () => resolve(false));
     p.once("exit", (code) => resolve(code === 0));
   });
@@ -107,7 +87,6 @@ async function detectPackageManager(projectPath: string): Promise<PackageManager
   if (hasPnpm) return "pnpm";
   if (hasNpm) return "npm";
   if (hasYarn) return "yarn";
-
   throw new Error("No package manager found. Install pnpm or Node.js (npm) to run preview.");
 }
 
@@ -116,9 +95,7 @@ async function isPortFree(host: string, port: number): Promise<boolean> {
     const server = net.createServer();
     server.unref();
     server.once("error", () => resolve(false));
-    server.listen(port, host, () => {
-      server.close(() => resolve(true));
-    });
+    server.listen(port, host, () => server.close(() => resolve(true)));
   });
 }
 
@@ -149,13 +126,7 @@ function httpProbe(urlString: string): Promise<boolean> {
       const url = new URL(urlString);
       const client = url.protocol === "https:" ? https : http;
       const req = client.request(
-        {
-          method: "GET",
-          hostname: url.hostname,
-          port: url.port,
-          path: url.pathname || "/",
-          timeout: 2500,
-        },
+        { method: "GET", hostname: url.hostname, port: url.port, path: url.pathname || "/", timeout: 2500 },
         (res) => {
           res.resume();
           resolve(true);
@@ -189,15 +160,9 @@ async function waitForServerReady(inst: Instance, urlBase: string, timeoutMs = D
 async function runCommandCapture(inst: Instance, cmd: string, args: string[], cwd: string) {
   return await new Promise<void>((resolve, reject) => {
     pushLogLine(inst, `▶ ${cmd} ${args.join(" ")}`);
-    const p = spawn(cmd, args, {
-      cwd,
-      shell: process.platform === "win32",
-      env: { ...process.env },
-    });
-
+    const p = spawn(cmd, args, { cwd, shell: process.platform === "win32", env: { ...process.env } });
     p.stdout?.on("data", (d: Buffer) => pushLogChunk(inst, d));
     p.stderr?.on("data", (d: Buffer) => pushLogChunk(inst, d));
-
     p.once("error", (err) => {
       pushLogLine(inst, `✖ ${err.message}`);
       reject(err);
@@ -216,7 +181,6 @@ async function runCommandCapture(inst: Instance, cmd: string, args: string[], cw
 async function ensureDeps(inst: Instance, pm: PackageManager, projectPath: string) {
   const nm = path.join(projectPath, "node_modules");
   if (fileExists(nm)) return;
-
   pushLogLine(inst, "📦 Installing dependencies (first run)…");
   if (pm === "pnpm") {
     await runCommandCapture(inst, "pnpm", ["install"], projectPath);
@@ -245,95 +209,143 @@ function toStatus(inst: Instance): PreviewStatus {
 
 async function killProcessTree(proc: ChildProcessWithoutNullStreams) {
   if (proc.killed) return;
-  try {
-    proc.kill("SIGTERM");
-  } catch {}
+  try { proc.kill("SIGTERM"); } catch {}
   await new Promise((r) => setTimeout(r, 1600));
   if (!proc.killed) {
-    try {
-      proc.kill("SIGKILL");
-    } catch {}
+    try { proc.kill("SIGKILL"); } catch {}
   }
 }
 
-function parseSemver(v: string): { major: number; minor: number; patch: number } | null {
-  const m = v.trim().match(/^v?(\d+)\.(\d+)\.(\d+)/);
-  if (!m) return null;
-  return { major: Number(m[1]), minor: Number(m[2]), patch: Number(m[3]) };
+async function readText(p: string): Promise<string | null> {
+  try { return await fs.promises.readFile(p, "utf-8"); } catch { return null; }
 }
 
-function gte(a: { major: number; minor: number; patch: number }, b: { major: number; minor: number; patch: number }) {
-  if (a.major !== b.major) return a.major > b.major;
-  if (a.minor !== b.minor) return a.minor > b.minor;
-  return a.patch >= b.patch;
+async function writeText(p: string, s: string): Promise<void> {
+  await fs.promises.mkdir(path.dirname(p), { recursive: true });
+  await fs.promises.writeFile(p, s.endsWith("\n") ? s : s + "\n", "utf-8");
 }
 
-async function nodeVersionInPath(): Promise<{ raw: string; sem: { major: number; minor: number; patch: number } | null }> {
-  return await new Promise((resolve) => {
-    const p = spawn("node", ["-v"], { stdio: ["ignore", "pipe", "ignore"], shell: process.platform === "win32" });
-    let out = "";
-    p.stdout.on("data", (d) => (out += String(d)));
-    p.on("error", () => resolve({ raw: "", sem: null }));
-    p.on("exit", () => {
-      const raw = out.trim();
-      resolve({ raw, sem: parseSemver(raw) });
-    });
-  });
-}
+/**
+ * Repair common AI-generated Next.js App Router breakages that cause `next dev` to exit instantly.
+ * This does NOT try to be perfect; it only fixes very specific, clearly-wrong patterns.
+ */
+async function repairProjectForPreview(inst: Instance, projectPath: string): Promise<void> {
+  const layoutCandidates = [
+    path.join(projectPath, "src/app/layout.tsx"),
+    path.join(projectPath, "app/layout.tsx"),
+  ];
+  const pageCandidates = [
+    path.join(projectPath, "src/app/page.tsx"),
+    path.join(projectPath, "app/page.tsx"),
+  ];
 
-async function readPackageJson(projectPath: string): Promise<any | null> {
-  try {
-    const raw = await fs.promises.readFile(path.join(projectPath, "package.json"), "utf-8");
-    return JSON.parse(raw);
-  } catch {
-    return null;
-  }
-}
+  // 1) Fix invalid App Router layout created from next/app (Pages Router API).
+  for (const layoutPath of layoutCandidates) {
+    const src = await readText(layoutPath);
+    if (!src) continue;
 
-function getNextMajor(pkg: any): number | null {
-  const v = pkg?.dependencies?.next ?? pkg?.devDependencies?.next;
-  if (!v || typeof v !== "string") return null;
-  const m = v.match(/(\d+)\./);
-  if (!m) return null;
-  return Number(m[1]);
-}
+    const looksWrong =
+      src.includes("from 'next/app'") ||
+      src.includes('from "next/app"') ||
+      src.includes("AppProps") ||
+      src.includes("AppRouter") ||
+      src.includes("function MyApp");
 
-async function maybeAutoFixNextNodeMismatch(inst: Instance, pm: PackageManager, projectPath: string) {
-  const pkg = await readPackageJson(projectPath);
-  if (!pkg) return;
+    if (looksWrong) {
+      pushLogLine(inst, `🛠 Repair: Rewriting invalid App Router layout: ${path.relative(projectPath, layoutPath)}`);
+      const fixed = `import "./globals.css";
+import type { Metadata } from "next";
+import React from "react";
 
-  const nextMajor = getNextMajor(pkg);
-  if (nextMajor == null) return;
+export const metadata: Metadata = {
+  title: "VorByte App",
+  description: "Generated by VorByte",
+};
 
-  // If next is 16+ we know (from Next engines) it requires Node >= 20.9.0.
-  if (nextMajor < 16) return;
-
-  const nv = await nodeVersionInPath();
-  if (!nv.sem) return;
-
-  if (gte(nv.sem, NODE_REQ_FOR_NEXT16)) return;
-
-  pushLogLine(
-    inst,
-    `⚠ Detected Next.js ${nextMajor}.x which typically requires Node >= ${NODE_REQ_FOR_NEXT16.major}.${NODE_REQ_FOR_NEXT16.minor}.0, but PATH node is ${nv.raw}.`
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <html lang="en">
+      <body className="min-h-screen">{children}</body>
+    </html>
   );
-  pushLogLine(inst, `↪ Auto-fix: downgrading project to Next.js 14.x + React 18 for compatibility (preview only).`);
+}
+`;
+      await writeText(layoutPath, fixed);
+    }
+  }
 
-  // Downgrade to a widely compatible set:
-  // - next@14.2.23
-  // - react@18.3.1
-  // - react-dom@18.3.1
-  if (pm === "pnpm") {
-    await runCommandCapture(inst, "pnpm", ["add", "next@14.2.23", "react@18.3.1", "react-dom@18.3.1"], projectPath);
-    await runCommandCapture(inst, "pnpm", ["install"], projectPath);
-    return;
+  // 2) Ensure a minimal Button component exists if the project uses shadcn-style imports.
+  const buttonRel = "src/components/ui/button.tsx";
+  const buttonAbs = path.join(projectPath, buttonRel);
+  if (!fileExists(buttonAbs)) {
+    // only add if we detect usage of Button in pages
+    let usesButton = false;
+    for (const pagePath of pageCandidates) {
+      const src = await readText(pagePath);
+      if (src && src.includes("Button")) {
+        usesButton = true;
+        break;
+      }
+    }
+    if (usesButton) {
+      pushLogLine(inst, `🛠 Repair: Adding missing UI button component (${buttonRel})`);
+      const btn = `import * as React from "react";
+
+function cn(...classes: Array<string | undefined | null | false>) {
+  return classes.filter(Boolean).join(" ");
+}
+
+export type ButtonProps = React.ButtonHTMLAttributes<HTMLButtonElement> & {
+  variant?: "default" | "secondary" | "outline";
+};
+
+export const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
+  ({ className, variant = "default", ...props }, ref) => {
+    return (
+      <button
+        ref={ref}
+        className={cn(
+          "inline-flex items-center justify-center rounded-md px-4 py-2 text-sm font-medium transition-colors",
+          variant === "default" && "bg-black text-white hover:bg-black/90",
+          variant === "secondary" && "bg-zinc-100 text-zinc-900 hover:bg-zinc-200",
+          variant === "outline" && "border border-zinc-200 bg-white hover:bg-zinc-50",
+          className
+        )}
+        {...props}
+      />
+    );
   }
-  if (pm === "yarn") {
-    await runCommandCapture(inst, "yarn", ["add", "next@14.2.23", "react@18.3.1", "react-dom@18.3.1"], projectPath);
-    await runCommandCapture(inst, "yarn", ["install"], projectPath);
-    return;
+);
+
+Button.displayName = "Button";
+`;
+      await writeText(buttonAbs, btn);
+    }
   }
-  await runCommandCapture(inst, "npm", ["install", "next@14.2.23", "react@18.3.1", "react-dom@18.3.1"], projectPath);
+
+  // 3) Rewrite bad imports like `import { Button } from '@shadcn/ui'` to local components.
+  for (const pagePath of pageCandidates) {
+    const src = await readText(pagePath);
+    if (!src) continue;
+
+    let next = src;
+
+    next = next.replace(/from\s+['"]@shadcn\/ui['"]/g, "from \"@/components/ui/button\"");
+    next = next.replace(/from\s+['"]shadcn\/ui['"]/g, "from \"@/components/ui/button\"");
+    next = next.replace(/import\s*\{\s*Button\s*\}\s*from\s*['"][^'"]*['"]\s*;?/g, 'import { Button } from "@/components/ui/button";');
+
+    // Also fix react 19 type errors in some templates by ensuring React import if JSX requires it (safe no-op in Next).
+    if (!next.includes("import React") && next.includes("function HomePage")) {
+      // Not necessary, but harmless.
+    }
+
+    if (next !== src) {
+      pushLogLine(inst, `🛠 Repair: Fixing bad Button import in ${path.relative(projectPath, pagePath)}`);
+      await writeText(pagePath, next);
+    }
+  }
+
+  // 4) Ensure tsconfig path alias for @/ exists? Too invasive; skip.
 }
 
 class PreviewManagerImpl implements PreviewManager {
@@ -351,7 +363,6 @@ class PreviewManagerImpl implements PreviewManager {
     const inst = this.instances.get(key);
     if (!inst) return [];
     const tail = opts?.tail ?? 250;
-    if (tail <= 0) return [];
     return inst.logs.slice(-tail);
   }
 
@@ -361,7 +372,6 @@ class PreviewManagerImpl implements PreviewManager {
 
     let inst = this.instances.get(projectPath);
     if (inst?.state === "running" && inst.proc && !inst.proc.killed) return toStatus(inst);
-
     if (!inst) {
       inst = { projectPath, state: "stopped", host, logs: [] };
       this.instances.set(projectPath, inst);
@@ -373,66 +383,52 @@ class PreviewManagerImpl implements PreviewManager {
     inst.startedAt = nowIso();
     inst.exited = false;
 
-    inst.readyByLog = new Promise<void>((resolve) => {
-      inst!.readyByLogResolve = resolve;
-    });
-
     pushLogLine(inst, `▶ Starting preview for ${projectPath}`);
 
-    const pkgJson = path.join(projectPath, "package.json");
-    if (!fileExists(pkgJson)) {
+    if (!fileExists(path.join(projectPath, "package.json"))) {
       inst.state = "error";
-      inst.error = "No package.json found in the project folder. Is this a valid project?";
+      inst.error = "No package.json found in the project folder.";
       pushLogLine(inst, `✖ ${inst.error}`);
       return toStatus(inst);
     }
 
-    // Stop old process if exists.
     if (inst.proc && !inst.proc.killed) {
       await killProcessTree(inst.proc);
       inst.proc = undefined;
       inst.pid = undefined;
     }
 
-    const preferredPort = opts.port ?? inst.port ?? 3000;
-    inst.port = await findFreePort(host, preferredPort);
+    inst.port = await findFreePort(host, opts.port ?? inst.port ?? 3000);
     inst.url = `http://${host}:${inst.port}`;
 
     const pm = await detectPackageManager(projectPath);
     pushLogLine(inst, `ℹ Using package manager: ${pm}`);
 
-    const autoInstall = opts.autoInstallDeps !== false;
-    if (autoInstall) {
+    if (opts.autoInstallDeps !== false) {
       try {
         await ensureDeps(inst, pm, projectPath);
-      } catch (err: any) {
+      } catch (e: any) {
         inst.state = "error";
-        inst.error = err?.message ?? String(err);
+        inst.error = e?.message ?? String(e);
         pushLogLine(inst, `✖ Failed to install dependencies: ${inst.error}`);
         return toStatus(inst);
       }
     }
 
-    // Auto-fix common Next/Node mismatch that causes instant exit.
+    // Repair common AI breakages before starting next dev.
     try {
-      await maybeAutoFixNextNodeMismatch(inst, pm, projectPath);
+      await repairProjectForPreview(inst, projectPath);
     } catch (e: any) {
-      inst.state = "error";
-      inst.error = e?.message ?? String(e);
-      pushLogLine(inst, `✖ ${inst.error}`);
-      return toStatus(inst);
+      pushLogLine(inst, `⚠ Repair step failed: ${e?.message ?? String(e)}`);
     }
 
-    // Start Next dev server via `dev` script. Use -p / -H flags for widest compatibility.
+    const portStr = String(inst.port);
     let cmd = pm;
     let args: string[] = [];
-    const portStr = String(inst.port);
 
-    if (pm === "pnpm") {
-      args = ["dev", "--", "-p", portStr, "-H", host];
-    } else if (pm === "yarn") {
-      args = ["dev", "-p", portStr, "-H", host];
-    } else {
+    if (pm === "pnpm") args = ["dev", "--", "-p", portStr, "-H", host];
+    else if (pm === "yarn") args = ["dev", "-p", portStr, "-H", host];
+    else {
       cmd = "npm";
       args = ["run", "dev", "--", "-p", portStr, "-H", host];
     }
@@ -440,11 +436,7 @@ class PreviewManagerImpl implements PreviewManager {
     pushLogLine(inst, `▶ ${cmd} ${args.join(" ")}`);
 
     try {
-      const proc = spawn(cmd, args, {
-        cwd: projectPath,
-        shell: process.platform === "win32",
-        env: { ...process.env, PORT: portStr, HOSTNAME: host },
-      });
+      const proc = spawn(cmd, args, { cwd: projectPath, shell: process.platform === "win32", env: { ...process.env, PORT: portStr, HOSTNAME: host } });
       inst.proc = proc;
       inst.pid = proc.pid;
 
@@ -452,6 +444,7 @@ class PreviewManagerImpl implements PreviewManager {
       proc.stderr.on("data", (d: Buffer) => pushLogChunk(inst!, d));
 
       proc.once("error", (err) => {
+        inst!.exited = true;
         inst!.state = "error";
         inst!.error = err.message;
         pushLogLine(inst!, `✖ ${err.message}`);
@@ -459,33 +452,25 @@ class PreviewManagerImpl implements PreviewManager {
 
       proc.once("exit", (code, signal) => {
         inst!.exited = true;
-        if (inst!.state === "running" || inst!.state === "starting") {
-          inst!.state = "error";
-          inst!.error = `Preview server exited early (code=${code ?? "n/a"} signal=${signal ?? "n/a"}).`;
-          pushLogLine(inst!, `✖ ${inst!.error}`);
-        } else {
-          pushLogLine(inst!, `■ Preview server exited (code=${code ?? "n/a"} signal=${signal ?? "n/a"})`);
-        }
+        inst!.state = "error";
+        const tail = inst!.logs.slice(-120).join("\n");
+        inst!.error =
+          `Preview server exited early (code=${code ?? "n/a"} signal=${signal ?? "n/a"}).\n\nLast logs:\n${tail}`;
+        pushLogLine(inst!, `✖ Preview server exited early.`);
       });
-    } catch (err: any) {
+    } catch (e: any) {
       inst.state = "error";
-      inst.error = err?.message ?? String(err);
+      inst.error = e?.message ?? String(e);
       pushLogLine(inst, `✖ ${inst.error}`);
       return toStatus(inst);
     }
 
-    // Give logs a little time to populate
-    try {
-      await Promise.race([inst.readyByLog ?? Promise.resolve(), new Promise((r) => setTimeout(r, 20_000))]);
-    } catch {}
-
     const ready = await waitForServerReady(inst, `${inst.url}/`, DEFAULT_READY_TIMEOUT_MS);
     if (!ready) {
-      if (!inst.error) {
-        inst.state = "error";
-        inst.error = `Preview did not become ready at ${inst.url} within ${Math.floor(DEFAULT_READY_TIMEOUT_MS / 1000)} seconds.`;
-        pushLogLine(inst, `✖ ${inst.error}`);
-      }
+      const tail = inst.logs.slice(-120).join("\n");
+      inst.state = "error";
+      inst.error = `Preview did not become ready at ${inst.url}.\n\nLast logs:\n${tail}`;
+      pushLogLine(inst, `✖ ${inst.error}`);
       return toStatus(inst);
     }
 
@@ -512,8 +497,7 @@ class PreviewManagerImpl implements PreviewManager {
   }
 
   async stopAll(): Promise<void> {
-    const keys = [...this.instances.keys()];
-    for (const key of keys) {
+    for (const key of [...this.instances.keys()]) {
       // eslint-disable-next-line no-await-in-loop
       await this.stop(key);
     }

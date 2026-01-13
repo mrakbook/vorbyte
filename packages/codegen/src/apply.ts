@@ -58,20 +58,16 @@ function splitDevDeps(deps: string[]): { prod: string[]; dev: string[] } {
 }
 
 /**
- * AI sometimes mistakes module import paths for npm packages, e.g.
- *   - next/link  (this is an import path, NOT a package)
- *   - next/image
- *   - next/navigation
- *
- * pnpm interprets "next/link" as a GitHub repo "next/link" and tries to `git ls-remote`,
- * which fails with exit code 128.
- *
- * We also filter common hallucinations:
- * - Tailwind directives mistaken as packages: @tailwindcss/base|components|utilities
- * - "shadcn/ui" and "ui" (shadcn is a generator, not an npm package)
+ * Filter invalid / harmful dependencies before running installs.
+ * This prevents:
+ * - Tailwind directive tokens mistaken as packages (404)
+ * - next/* import paths mistaken as packages (git ls-remote failures)
+ * - shadcn generator mistaken as packages (shadcn/ui, ui, @shadcn/ui)
+ * - URL/git dependencies (unreliable in this tool)
  */
 function filterInvalidDeps(deps: string[]): string[] {
   const denyExact = new Set<string>([
+    // Tailwind directives (not packages)
     "@tailwindcss/base",
     "@tailwindcss/components",
     "@tailwindcss/utilities",
@@ -81,11 +77,15 @@ function filterInvalidDeps(deps: string[]): string[] {
     "@tailwind/base",
     "@tailwind/components",
     "@tailwind/utilities",
+
+    // shadcn generator hallucinations / wrong meta package
     "shadcn/ui",
     "shadcn-ui",
     "shadcn",
     "ui",
-    // Explicitly block Next import paths often mistaken as deps
+    "@shadcn/ui",
+
+    // Next import paths commonly mistaken as deps
     "next/link",
     "next/image",
     "next/navigation",
@@ -102,7 +102,7 @@ function filterInvalidDeps(deps: string[]): string[] {
     // Reject whitespace tokens
     if (/\s/.test(name)) continue;
 
-    // Reject URL / git style deps (too fragile for this tool)
+    // Reject URL / git style deps
     const lower = name.toLowerCase();
     if (
       lower.startsWith("git+") ||
@@ -135,10 +135,6 @@ function filterInvalidDeps(deps: string[]): string[] {
   return out;
 }
 
-/**
- * Important: avoid pnpm workspace-root check by ALWAYS using:
- *   pnpm --dir <projectDir> add ... --ignore-workspace-root-check
- */
 async function installDeps(projectDir: string, deps: string[]): Promise<string[]> {
   const cleaned = filterInvalidDeps(deps);
   const needed = Array.from(new Set(cleaned.map((d) => d.trim()).filter(Boolean)));
@@ -151,6 +147,7 @@ async function installDeps(projectDir: string, deps: string[]): Promise<string[]
   const hasYarn = await cmdOk("yarn");
 
   if (hasPnpm) {
+    // Always install into project dir explicitly, bypass workspace root check
     const flags = ["--dir", projectDir, "--ignore-workspace-root-check"];
     if (prod.length) await run("pnpm", ["add", ...prod, ...flags], projectDir);
     if (dev.length) await run("pnpm", ["add", "-D", ...dev, ...flags], projectDir);
@@ -180,6 +177,5 @@ export async function applyChanges(opts: { projectDir: string; files: FileChange
   }
 
   const installedDependencies = await installDeps(opts.projectDir, opts.dependencies ?? []);
-
   return { writtenFiles, installedDependencies };
 }
