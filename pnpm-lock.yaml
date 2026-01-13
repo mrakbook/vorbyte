@@ -116,6 +116,15 @@ importers:
         specifier: ^5.3.3
         version: 5.9.3
 
+  packages/preview:
+    devDependencies:
+      '@types/node':
+        specifier: ^20.11.30
+        version: 20.19.28
+      typescript:
+        specifier: ^5.3.3
+        version: 5.9.3
+
   packages/template-kit:
     dependencies:
       '@radix-ui/react-dialog':

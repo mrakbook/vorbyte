@@ -16,17 +16,23 @@ import type {
   FileTreeNode,
   ChatMessage,
   AiRunRequest,
-  AiRunResult
+  AiRunResult,
+  DesignApplyRequest,
+  DesignApplyResult
 } from '../shared/types'
 
 // Milestone 2 modules (kept in packages/, imported as source to avoid build-order friction in dev)
 import { createAIEngine, type ChatMessage as EngineChatMessage } from '../../../../packages/engine/src/index'
 import { parseAiResponse, applyChanges } from '../../../../packages/codegen/src/index'
+import { createPreviewManager } from '../../../../packages/preview/src/index'
 
 /**
  * Load .env (in dev, this will pick up apps/studio/.env).
  */
 dotenv.config()
+
+// Milestone 3: Preview server manager (Next.js dev server runner)
+const previewManager = createPreviewManager()
 
 const PROJECT_META_PATH = path.join('.vorbyte', 'project.json')
 const CHAT_HISTORY_PATH = path.join('.vorbyte', 'chat.json')
@@ -94,7 +100,6 @@ function envPathAny(names: string[]): string | undefined {
   return undefined
 }
 
-
 function defaultProjectsRoot(): string {
   // Prefer explicit env if provided
   const p = envPathAny(['VORBYTE_PROJECTS_ROOT', 'vorbyte_PROJECTS_ROOT', 'LOCALFORGE_PROJECTS_ROOT'])
@@ -130,7 +135,6 @@ function sanitizeFolderName(name: string): string {
     .trim()
     .slice(0, 80)
 }
-
 
 async function readJson<T>(filePath: string): Promise<T | null> {
   try {
@@ -465,7 +469,7 @@ function buildSystemPrompt(): string {
   return [
     'You are VorByte, an expert Next.js (App Router) + Tailwind + shadcn/ui developer.',
     '',
-    'Your job is to generate or modify code in the user\'s Next.js project.',
+    "Your job is to generate or modify code in the user's Next.js project.",
     '',
     'Hard requirements:',
     '- Use Next.js App Router conventions (app/ directory).',
@@ -578,9 +582,9 @@ async function runAiAndApply(req: AiRunRequest): Promise<AiRunResult> {
         ? (() => {
             const baseUrl = firstEnv(['VORBYTE_OPENAI_BASE_URL', 'vorbyte_OPENAI_BASE_URL'])
             const apiKey = settings.openaiApiKey?.trim() ?? ''
-            const isLocalBaseUrl = !!baseUrl && /(localhost|127\.0\.0\.1|::1|\[::1\])/.test(baseUrl)
+            const isLocalBaseUrl = !!baseUrl && /(localhost|127\.0\.0\.1)/.test(baseUrl)
             if (!apiKey && !isLocalBaseUrl) {
-              throw new Error('OpenAI API key is missing.\n\nGo to Settings → OpenAI API Key and paste your key, then try again.\n\nTip: For offline/local use, create the project with AI Mode = Local (Ollama).')
+              throw new Error('OpenAI API key is missing. Set it in Settings (Cloud mode).')
             }
             return createAIEngine({
               provider: 'openai',
@@ -589,7 +593,7 @@ async function runAiAndApply(req: AiRunRequest): Promise<AiRunResult> {
           })()
         : (() => {
             const { model } = parseLocalModel(localModelRaw)
-            const baseUrl = firstEnv(['VORBYTE_OLLAMA_BASE_URL', 'vorbyte_OLLAMA_BASE_URL']) ?? 'http://127.0.0.1:11434'
+            const baseUrl = firstEnv(['VORBYTE_OLLAMA_BASE_URL', 'vorbyte_OLLAMA_BASE_URL']) ?? 'http://localhost:11434'
             return createAIEngine({
               provider: 'ollama',
               ollama: { baseUrl, model, temperature: 0.2 }
@@ -692,13 +696,247 @@ app.whenReady().then(() => {
   })
 })
 
+app.on('before-quit', () => {
+  previewManager.stopAll().catch(() => {})
+})
+
 app.on('window-all-closed', () => {
+  // On macOS, the app stays alive after closing windows. Ensure we don't leave orphan preview servers.
+  void previewManager.stopAll().catch(() => {})
   if (process.platform !== 'darwin') app.quit()
 })
 
 /**
  * IPC handlers
  */
+/**
+ * Milestone 4 (WYSIWYG): Apply a visual edit by doing a best-effort find/replace in the user's code.
+ *
+ * NOTE: This is intentionally conservative and heuristic-based (no AST yet). It works best for:
+ * - App Router pages (e.g., src/app/.../page.tsx)
+ * - Unique text edits
+ * - Simple className strings (no heavy conditional concatenation)
+ */
+function normalizeRoute(route: string): string {
+  const raw = (route ?? '').toString().trim()
+  if (!raw) return '/'
+  const noHash = raw.split('#')[0] ?? raw
+  const noQuery = noHash.split('?')[0] ?? noHash
+  const withLeading = noQuery.startsWith('/') ? noQuery : `/${noQuery}`
+  return withLeading === '' ? '/' : withLeading
+}
+
+function candidatePageRelPaths(route: string): string[] {
+  const r = normalizeRoute(route)
+  const segs = r.split('/').filter(Boolean)
+
+  // Next.js App Router
+  const appSubPath = segs.length ? `${segs.join('/')}/page.tsx` : 'page.tsx'
+  const appSubPathJsx = segs.length ? `${segs.join('/')}/page.jsx` : 'page.jsx'
+  const appSubPathTs = segs.length ? `${segs.join('/')}/page.ts` : 'page.ts'
+  const appSubPathJs = segs.length ? `${segs.join('/')}/page.js` : 'page.js'
+
+  // Next.js Pages Router fallbacks
+  const pagesPath = segs.length ? `${segs.join('/')}.tsx` : 'index.tsx'
+  const pagesPathJsx = segs.length ? `${segs.join('/')}.jsx` : 'index.jsx'
+
+  const candidates = [
+    // App Router (common)
+    `src/app/${appSubPath}`,
+    `app/${appSubPath}`,
+    `src/app/${appSubPathJsx}`,
+    `app/${appSubPathJsx}`,
+    `src/app/${appSubPathTs}`,
+    `app/${appSubPathTs}`,
+    `src/app/${appSubPathJs}`,
+    `app/${appSubPathJs}`,
+
+    // Pages Router
+    `src/pages/${pagesPath}`,
+    `pages/${pagesPath}`,
+    `src/pages/${pagesPathJsx}`,
+    `pages/${pagesPathJsx}`
+  ]
+
+  // De-dupe
+  return Array.from(new Set(candidates))
+}
+
+async function firstExistingRelPath(projectDir: string, relPaths: string[]): Promise<string | null> {
+  for (const rel of relPaths) {
+    const abs = path.join(projectDir, rel)
+    try {
+      const st = await fsp.stat(abs)
+      if (st.isFile()) return rel
+    } catch {
+      // ignore
+    }
+  }
+  return null
+}
+
+const DESIGN_SCAN_SKIP_DIRS = new Set([
+  'node_modules',
+  '.next',
+  '.git',
+  'dist',
+  'out',
+  'build',
+  '.turbo',
+  '.cache'
+])
+
+async function listCodeFiles(root: string, exts: Set<string>, limit: number): Promise<string[]> {
+  const results: string[] = []
+
+  async function walk(dir: string) {
+    if (results.length >= limit) return
+
+    let entries: fs.Dirent[]
+    try {
+      entries = await fsp.readdir(dir, { withFileTypes: true })
+    } catch {
+      return
+    }
+
+    for (const ent of entries) {
+      if (results.length >= limit) return
+      const name = ent.name
+      if (ent.isDirectory()) {
+        if (DESIGN_SCAN_SKIP_DIRS.has(name)) continue
+        await walk(path.join(dir, name))
+        continue
+      }
+      if (!ent.isFile()) continue
+
+      const ext = path.extname(name).toLowerCase()
+      if (!exts.has(ext)) continue
+      results.push(path.join(dir, name))
+    }
+  }
+
+  await walk(root)
+  return results
+}
+
+function replaceOnce(haystack: string, needle: string, replacement: string): string | null {
+  const idx = haystack.indexOf(needle)
+  if (idx === -1) return null
+  return haystack.slice(0, idx) + replacement + haystack.slice(idx + needle.length)
+}
+
+async function applyDesignEdit(req: DesignApplyRequest): Promise<DesignApplyResult> {
+  const projectDir = req.projectPath
+  if (!projectDir) return { ok: false, message: 'Missing projectPath' }
+
+  const wantText =
+    typeof req.originalText === 'string' &&
+    typeof req.newText === 'string' &&
+    req.originalText !== req.newText &&
+    req.originalText.trim().length > 0
+
+  const wantClass =
+    typeof req.originalClassName === 'string' &&
+    typeof req.newClassName === 'string' &&
+    req.originalClassName !== req.newClassName &&
+    req.originalClassName.trim().length > 0
+
+  if (!wantText && !wantClass) {
+    return { ok: false, message: 'Nothing to apply (no changes detected).' }
+  }
+
+  const route = normalizeRoute(req.route)
+  const candidatesAbs: string[] = []
+  const seen = new Set<string>()
+
+  // 1) Prefer the route's page file if it exists.
+  const primaryRel = await firstExistingRelPath(projectDir, candidatePageRelPaths(route))
+  if (primaryRel) {
+    const abs = path.join(projectDir, primaryRel)
+    candidatesAbs.push(abs)
+    seen.add(abs)
+  }
+
+  // 2) Fallback: scan likely source roots for any file that contains the original text/class.
+  const scanRoots = [
+    path.join(projectDir, 'src'),
+    path.join(projectDir, 'app'),
+    path.join(projectDir, 'components'),
+    path.join(projectDir, 'src', 'components'),
+    path.join(projectDir, 'src', 'app')
+  ]
+
+  const exts = new Set(['.tsx', '.ts', '.jsx', '.js'])
+  const scanLimit = 500
+
+  for (const root of scanRoots) {
+    try {
+      const st = await fsp.stat(root)
+      if (!st.isDirectory()) continue
+    } catch {
+      continue
+    }
+
+    const files = await listCodeFiles(root, exts, scanLimit)
+    for (const f of files) {
+      if (seen.has(f)) continue
+      candidatesAbs.push(f)
+      seen.add(f)
+    }
+  }
+
+  let lastMissReason = 'No matching file found.'
+  for (const absPath of candidatesAbs) {
+    let src: string
+    try {
+      src = await fsp.readFile(absPath, 'utf8')
+    } catch {
+      continue
+    }
+
+    let next = src
+    let changed = false
+
+    if (wantText) {
+      const patched = replaceOnce(next, req.originalText!, req.newText!)
+      if (patched) {
+        next = patched
+        changed = true
+      } else {
+        lastMissReason = `Could not find original text in ${path.relative(projectDir, absPath)}`
+      }
+    }
+
+    if (wantClass) {
+      const patched = replaceOnce(next, req.originalClassName!, req.newClassName!)
+      if (patched) {
+        next = patched
+        changed = true
+      } else {
+        lastMissReason = `Could not find original className in ${path.relative(projectDir, absPath)}`
+      }
+    }
+
+    if (!changed) continue
+
+    const rel = path.relative(projectDir, absPath).replace(/\\/g, '/')
+    await applyChanges({
+      projectDir,
+      files: [{ path: rel, content: next }],
+      dependencies: []
+    })
+
+    return { ok: true, updatedFile: rel }
+  }
+
+  return {
+    ok: false,
+    message:
+      lastMissReason +
+      ' This WYSIWYG editor is best-effort right now. If it cannot locate the right source, switch to Chat mode and ask the AI to make the change.'
+  }
+}
+
 ipcMain.handle('settings:get', async () => loadSettings())
 ipcMain.handle('settings:save', async (_evt, next: AppSettings) => saveSettings(next))
 
@@ -742,6 +980,32 @@ ipcMain.handle('ai:cancel', async (_evt, requestId: string) => {
   const ac = aiRuns.get(requestId)
   if (ac) ac.abort()
   return true
+})
+
+// Milestone 3: Live Preview (Next.js dev server) IPC
+ipcMain.handle('preview:start', async (_evt, projectPath: string, opts?: { port?: number; autoInstallDeps?: boolean }) => {
+  return previewManager.start({
+    projectPath,
+    port: opts?.port,
+    autoInstallDeps: opts?.autoInstallDeps
+  })
+})
+
+ipcMain.handle('preview:stop', async (_evt, projectPath: string) => {
+  return previewManager.stop(projectPath)
+})
+
+ipcMain.handle('preview:status', async (_evt, projectPath: string) => {
+  return previewManager.status(projectPath)
+})
+
+ipcMain.handle('preview:logs', async (_evt, projectPath: string, opts?: { tail?: number }) => {
+  return previewManager.logs(projectPath, opts)
+})
+
+
+ipcMain.handle('design:apply', async (_evt, req: DesignApplyRequest): Promise<DesignApplyResult> => {
+  return applyDesignEdit(req)
 })
 
 ipcMain.handle('dialog:selectDirectory', async (_evt, opts?: { defaultPath?: string }) => {

@@ -1,120 +1,3 @@
-export type AiMode = 'local' | 'cloud'
-
-export type ChatRole = 'system' | 'user' | 'assistant'
-
-export interface ChatMessage {
-  id: string
-  role: ChatRole
-  content: string
-  createdAt: string
-}
-
-/**
- * Template definitions live under packages/templates.
- */
-export interface TemplateSummary {
-  id: string
-  name: string
-  description: string
-  /**
-   * Path relative to templates root (example: "templates/landing-page/thumbnail.png")
-   * Renderer should NOT load this directly; use templates.thumbnailData(templateId).
-   */
-  thumbnail?: string
-  /**
-   * Path relative to templates root (example: "templates/landing-page/overlay")
-   */
-  overlayDir: string
-  tags?: string[]
-}
-
-export interface CreateProjectRequest {
-  name: string
-  /**
-   * Omit/undefined means "Start from scratch"
-   */
-  templateId?: string
-  aiMode?: AiMode
-  cloudModel?: string
-  /**
-   * For Milestone 1/2: can be a local model name ("llama3.1") or "ollama:llama3.1".
-   * (Later: can become a richer config object.)
-   */
-  localModel?: string
-  enableImageGeneration?: boolean
-  initGit?: boolean
-}
-
-export interface ProjectSummary {
-  name: string
-  path: string
-  createdAt?: string
-  templateId?: string
-}
-
-export type FileTreeNodeType = 'file' | 'dir'
-
-export interface FileTreeNode {
-  path: string
-  name: string
-  type: FileTreeNodeType
-  children?: FileTreeNode[]
-}
-
-export interface EnvVarPair {
-  key: string
-  value: string
-}
-
-export interface AppSettings {
-  /**
-   * Folder where projects are created/listed.
-   */
-  projectsRoot?: string
-
-  /**
-   * Stored for Milestone 1 persistence; secure storage can be added later.
-   */
-  openaiApiKey?: string
-
-  aiMode?: AiMode
-  cloudModel?: string
-
-  /**
-   * For Milestone 1 UI: can be a local model path OR a model name (Ollama).
-   * Milestone 2 uses it as a model name by default.
-   */
-  localModelPath?: string
-
-  /**
-   * Simple env var UI storage.
-   */
-  envVars?: EnvVarPair[]
-}
-
-export interface SelectDirectoryOptions {
-  title?: string
-  defaultPath?: string
-}
-
-/**
- * Milestone 2: run a prompt through the AI engine and apply file changes into the project dir.
- */
-export interface AiRunRequest {
-  projectPath: string
-  prompt: string
-  /**
-   * Optional id for cancellation.
-   */
-  requestId?: string
-}
-
-export interface AiRunResult {
-  chat: ChatMessage[]
-  appliedFiles: string[]
-  installedDependencies: string[]
-}
-
 export interface VorByteApi {
   projects: {
     list: () => Promise<ProjectSummary[]>
@@ -153,6 +36,17 @@ export interface VorByteApi {
     run: (req: AiRunRequest) => Promise<AiRunResult>
     cancel: (requestId: string) => Promise<void>
   }
+  preview: {
+    start: (projectPath: string, opts?: PreviewStartOptions) => Promise<PreviewStatus>
+    stop: (projectPath: string) => Promise<boolean>
+    status: (projectPath: string) => Promise<PreviewStatus>
+    logs: (projectPath: string, opts?: PreviewLogsOptions) => Promise<string[]>
+  }
+
+design: {
+  /** Apply a visual (WYSIWYG) edit to the project's source code (best-effort). */
+  apply: (req: DesignApplyRequest) => Promise<DesignApplyResult>
+}
   dialog: {
     selectDirectory: (opts?: SelectDirectoryOptions) => Promise<string | null>
   }
@@ -163,6 +57,43 @@ export interface VorByteApi {
  * Some older UI code used flat function names (window.api.projectsCreate).
  * Keep these around so refactors don't break the renderer.
  */
+
+export interface DesignSelection {
+  /** A CSS selector that identifies the element inside the preview DOM. */
+  selector: string
+  /** Lowercase HTML tag name (e.g. "h1", "button", "div"). */
+  tag: string
+  /** Best-effort user-visible text for the element (trimmed). */
+  text?: string
+  /** Best-effort className / class attribute string for the element. */
+  className?: string
+}
+
+export interface DesignApplyRequest {
+  /** Absolute path to the project on disk. */
+  projectPath: string
+  /** Current route in the preview (e.g. "/", "/about"). Used to pick a primary target file. */
+  route: string
+  /** CSS selector for the selected element (from DesignSelection.selector). */
+  selector: string
+
+  /** Text replacement (best-effort). */
+  originalText?: string
+  newText?: string
+
+  /** className replacement (best-effort). */
+  originalClassName?: string
+  newClassName?: string
+}
+
+export interface DesignApplyResult {
+  ok: boolean
+  /** Relative path (from project root) of the file updated, if any. */
+  updatedFile?: string
+  /** Human-readable message, especially on failures. */
+  message?: string
+}
+
 export interface VorByteApiCompat {
   projectsList: () => Promise<ProjectSummary[]>
   projectsCreate: (req: CreateProjectRequest) => Promise<ProjectSummary>
@@ -180,6 +111,14 @@ export interface VorByteApiCompat {
    * Some UI code used window.api.chatWrite(projectPath, chat).
    */
   chatWrite: (projectPath: string, chat: ChatMessage[]) => Promise<boolean>
+  /**
+   * Milestone 3 (Preview) back-compat: some UI code may use flat names.
+   */
+  previewStart: (projectPath: string, opts?: PreviewStartOptions) => Promise<PreviewStatus>
+  previewStop: (projectPath: string) => Promise<boolean>
+  previewStatus: (projectPath: string) => Promise<PreviewStatus>
+  previewLogs: (projectPath: string, opts?: PreviewLogsOptions) => Promise<string[]>
+  designApply: (req: DesignApplyRequest) => Promise<DesignApplyResult>
 }
 
 export type VorByteApiWithCompat = VorByteApi & VorByteApiCompat

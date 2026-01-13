@@ -1,13 +1,30 @@
 <!doctype html>
-<html>
+<html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <title>vorbyte Studio</title>
-    <!-- https://developer.mozilla.org/en-US/docs/Web/HTTP/CSP -->
+    <link rel="icon" type="image/svg+xml" href="/electron-vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+    <!--
+      Fix: allow stylesheets from 'self' (required for production builds where Vite extracts CSS).
+      The previous CSP was missing: style-src 'self'
+      which caused the UI styling/layout to be blocked in production.
+    -->
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:"
+      content="
+        default-src 'self';
+        script-src 'self' 'unsafe-eval';
+        style-src 'self' 'unsafe-inline';
+        img-src 'self' data: blob: http://localhost:* http://127.0.0.1:*;
+        font-src 'self' data:;
+        connect-src 'self' ws: wss: http://localhost:* http://127.0.0.1:*;
+        frame-src 'self' http://localhost:* http://127.0.0.1:*;
+        worker-src 'self' blob:;
+      "
     />
+
+    <title>VorByte Studio</title>
   </head>
 
   <body>

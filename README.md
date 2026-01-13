@@ -1,6 +1,6 @@
 # Vorbyte
 
-Vorbyte is a local-first AI web app builder (v0-style) that turns prompts into working web apps you can iterate on quickly. It’s designed to run primarily on your machine for speed and privacy, with optional cloud model support when configured.
+Vorbyte is a local-first AI web app builder that turns prompts into working web apps you can iterate on quickly. It’s designed to run primarily on your machine for speed and privacy, with optional cloud model support when configured.
 
 ## What it does (high level)
 

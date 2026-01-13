@@ -1,11 +1,15 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type {
   AppSettings,
   ChatMessage,
   CreateProjectRequest,
   FileTreeNode,
   ProjectSummary,
-  TemplateSummary
+  TemplateSummary,
+  PreviewStatus,
+  DesignSelection,
+  DesignApplyRequest,
+  DesignApplyResult,
 } from '@shared/types'
 
 const APP_TITLE = 'VorByte Studio'
@@ -145,8 +149,8 @@ function SettingsModal(props: {
           <div className="text-sm font-semibold">OpenAI API key</div>
           <input
             className="w-full rounded border px-3 py-2 text-sm"
-            value={draft.openAiApiKey ?? ''}
-            onChange={(e) => setDraft((d) => ({ ...d, openAiApiKey: e.target.value }))}
+            value={draft.openaiApiKey ?? ''}
+            onChange={(e) => setDraft((d) => ({ ...d, openaiApiKey: e.target.value }))}
             placeholder="sk-..."
           />
           <div className="text-xs text-zinc-600">
@@ -155,14 +159,14 @@ function SettingsModal(props: {
         </div>
 
         <div className="space-y-2">
-          <div className="text-sm font-semibold">Local model endpoint</div>
+          <div className="text-sm font-semibold">Local model</div>
           <input
             className="w-full rounded border px-3 py-2 text-sm"
-            value={draft.localModelEndpoint ?? ''}
-            onChange={(e) => setDraft((d) => ({ ...d, localModelEndpoint: e.target.value }))}
-            placeholder="http://localhost:11434"
+            value={draft.localModelPath ?? ''}
+            onChange={(e) => setDraft((d) => ({ ...d, localModelPath: e.target.value }))}
+            placeholder="ollama:llama3.1"
           />
-          <div className="text-xs text-zinc-600">Ollama default is http://localhost:11434</div>
+          <div className="text-xs text-zinc-600">Format: <code>provider:model</code> (example: <code>ollama:llama3.1</code>). To change the Ollama server URL, set <code>VORBYTE_OLLAMA_BASE_URL</code>.</div>
         </div>
 
         <div className="flex justify-end gap-2 pt-2">
@@ -427,6 +431,34 @@ export default function App() {
   const [tree, setTree] = useState<FileTreeNode | null>(null)
 
   const [mode, setMode] = useState<'chat' | 'design'>('chat')
+
+  // Milestone 3: Live preview state
+  const [previewRoute, setPreviewRoute] = useState<string>('/')
+  const [previewFrameNonce, setPreviewFrameNonce] = useState(0)
+  const [previewStatus, setPreviewStatus] = useState<PreviewStatus | null>(null)
+  const [previewLogs, setPreviewLogs] = useState<string[]>([])
+  const [previewStarting, setPreviewStarting] = useState(false)
+  const lastProjectPathRef = useRef<string | null>(null)
+
+// Milestone 4: WYSIWYG selection/edit state (best-effort v1)
+const previewIframeRef = useRef<HTMLIFrameElement | null>(null)
+const [designBridgeReady, setDesignBridgeReady] = useState(false)
+const [designInspectEnabled, setDesignInspectEnabled] = useState(false)
+const [designSelection, setDesignSelection] = useState<DesignSelection | null>(null)
+const [designTextDraft, setDesignTextDraft] = useState('')
+const [designClassDraft, setDesignClassDraft] = useState('')
+const [designApplying, setDesignApplying] = useState(false)
+const [designApplyError, setDesignApplyError] = useState<string | null>(null)
+
+  const previewSrc = useMemo(() => {
+    if (!previewStatus || previewStatus.state !== 'running') return null
+    const base = previewStatus.url
+    if (!base) return null
+    const cleanBase = base.replace(/\/$/, '')
+    const routeRaw = previewRoute || '/'
+    const route = routeRaw.startsWith('/') ? routeRaw : `/${routeRaw}`
+    return `${cleanBase}${route === '/' ? '/' : route}`
+  }, [previewStatus?.state, previewStatus?.url, previewRoute])
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [draft, setDraft] = useState('')
 
@@ -553,6 +585,65 @@ export default function App() {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages.length])
 
+  // --- Preview lifecycle (Milestone 3) --------------------------------------
+
+  useEffect(() => {
+    const nextPath = activeProject?.path ?? null
+    const prevPath = lastProjectPathRef.current
+
+    // Stop any previous project's preview server when switching/closing.
+    if (prevPath && prevPath !== nextPath) {
+      void window.api.preview.stop(prevPath).catch(() => {})
+    }
+
+    if (prevPath !== nextPath) {
+      setPreviewStatus(null)
+      setPreviewLogs([])
+      setPreviewRoute('/')
+      setPreviewFrameNonce((n) => n + 1)
+    }
+
+    lastProjectPathRef.current = nextPath
+  }, [activeProject?.path])
+
+  // Start preview automatically when entering Design mode.
+  useEffect(() => {
+    if (mode !== 'design' || !activeProject) return
+    if (previewStarting) return
+    void startPreview(false)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode, activeProject?.path])
+
+  // Poll status/logs while in Design mode (simple + robust).
+  useEffect(() => {
+    if (mode !== 'design' || !activeProject) return
+
+    let cancelled = false
+    const projectPath = activeProject.path
+
+    const poll = async () => {
+      try {
+        const st = await window.api.preview.status(projectPath)
+        if (cancelled) return
+        setPreviewStatus(st)
+
+        const logs = await window.api.preview.logs(projectPath, { tail: 250 })
+        if (cancelled) return
+        setPreviewLogs(logs)
+      } catch {
+        // Ignore transient errors (server starting, etc.)
+      }
+    }
+
+    void poll()
+    const interval = window.setInterval(poll, 1200)
+
+    return () => {
+      cancelled = true
+      window.clearInterval(interval)
+    }
+  }, [mode, activeProject?.path])
+
   async function openProject(p: ProjectSummary) {
     setActiveProject(p)
     setMode('chat')
@@ -611,6 +702,7 @@ export default function App() {
       setMessages(res.chat)
       const t = await window.api.fs.tree(activeProject.path, { maxDepth: 6 })
       setTree(t)
+      if (mode === 'design') setPreviewFrameNonce((n) => n + 1)
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
       setMessages((m) => m.map((x) => (x.id === pendingId ? { ...x, content: `⚠️ ${msg}` } : x)))
@@ -627,6 +719,222 @@ export default function App() {
       sendMessage()
     }
   }
+
+
+  function closeProject() {
+    const projectPath = activeProject?.path
+    setActiveProject(null)
+    setTree(null)
+    setMessages([])
+    setPreviewRoute('/')
+    setMode('chat')
+
+    // Stop preview in the background.
+    if (projectPath) {
+      void window.api.preview.stop(projectPath).catch(() => {})
+    }
+  }
+
+  function toPosixPath(p: string) {
+    return p.replace(/\\/g, '/')
+  }
+
+  function guessRouteFromFilePath(filePath: string): string | null {
+    const p = toPosixPath(filePath)
+
+    // --- Next.js App Router -------------------------------------------------
+    const appMarker = p.includes('/src/app/') ? '/src/app/' : p.includes('/app/') ? '/app/' : null
+    if (appMarker) {
+      const isPage = /\/page\.(tsx|ts|jsx|js)$/i.test(p)
+      if (!isPage) return null
+
+      const after = p.split(appMarker)[1] ?? ''
+      const withoutFile = after.replace(/\/page\.(tsx|ts|jsx|js)$/i, '')
+      const segments = withoutFile
+        .split('/')
+        .filter(Boolean)
+        // Ignore route groups like (marketing)
+        .filter((seg) => !(seg.startsWith('(') && seg.endsWith(')')))
+
+      const route = '/' + segments.join('/')
+      return route === '/' ? '/' : route
+    }
+
+    // --- Next.js Pages Router -----------------------------------------------
+    const pagesMarker = p.includes('/src/pages/') ? '/src/pages/' : p.includes('/pages/') ? '/pages/' : null
+    if (pagesMarker) {
+      if (!/\.(tsx|ts|jsx|js)$/i.test(p)) return null
+
+      const after = p.split(pagesMarker)[1]
+      if (!after) return null
+
+      const withoutExt = after.replace(/\.(tsx|ts|jsx|js)$/i, '')
+      const segments = withoutExt.split('/').filter(Boolean)
+
+      const last = segments[segments.length - 1] ?? ''
+      // Ignore special Next files
+      if (last.startsWith('_')) return null
+
+      // index => folder route
+      if (last === 'index') segments.pop()
+
+      const route = '/' + segments.join('/')
+      return route === '/' ? '/' : route
+    }
+
+    return null
+  }
+
+  async function startPreview(forceRestart: boolean) {
+    if (!activeProject) return
+
+    const projectPath = activeProject.path
+    setPreviewStarting(true)
+    setError(null)
+
+    try {
+      if (forceRestart) {
+        await window.api.preview.stop(projectPath).catch(() => {})
+      }
+
+      const st = await window.api.preview.start(projectPath, { autoInstallDeps: true })
+      setPreviewStatus(st)
+
+      if (st.state === 'error' && st.error) {
+        setError(st.error)
+      }
+
+      const logs = await window.api.preview.logs(projectPath, { tail: 250 })
+      setPreviewLogs(logs)
+
+      // Force-refresh the embedded frame (useful after restarts).
+      setPreviewFrameNonce((n) => n + 1)
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      setError(msg)
+      setPreviewStatus({
+        projectPath,
+        state: 'error',
+        error: msg
+      })
+    } finally {
+      setPreviewStarting(false)
+    }
+  }
+
+  async function stopPreview() {
+    if (!activeProject) return
+
+    const projectPath = activeProject.path
+    setPreviewStarting(true)
+    setError(null)
+
+    try {
+      await window.api.preview.stop(projectPath)
+      const st = await window.api.preview.status(projectPath)
+      setPreviewStatus(st)
+
+      const logs = await window.api.preview.logs(projectPath, { tail: 250 })
+      setPreviewLogs(logs)
+
+      setPreviewFrameNonce((n) => n + 1)
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      setError(msg)
+      setPreviewStatus({
+        projectPath,
+        state: 'error',
+        error: msg
+      })
+    } finally {
+      setPreviewStarting(false)
+    }
+  }
+
+
+// --- Milestone 4: Design Bridge messaging (WYSIWYG v1) ---
+const postToPreview = useCallback((payload: any) => {
+  const win = previewIframeRef.current?.contentWindow
+  if (!win) return
+  win.postMessage(payload, '*')
+}, [])
+
+// Listen for messages from the preview's VorByteDesignBridge (running inside the iframe).
+useEffect(() => {
+  const onMessage = (event: MessageEvent) => {
+    const data = event.data as any
+    if (!data || typeof data !== 'object') return
+    if (data.kind !== 'vorbyte:design') return
+
+    if (data.type === 'ready' || data.type === 'pong') {
+      setDesignBridgeReady(true)
+      return
+    }
+
+    if (data.type === 'selected') {
+      const sel = data.selection as DesignSelection | undefined
+      if (sel) setDesignSelection(sel)
+      return
+    }
+  }
+
+  window.addEventListener('message', onMessage)
+  return () => window.removeEventListener('message', onMessage)
+}, [])
+
+// Keep draft inputs in sync with the latest selection.
+useEffect(() => {
+  if (!designSelection) return
+  setDesignTextDraft(designSelection.text ?? '')
+  setDesignClassDraft(designSelection.className ?? '')
+  setDesignApplyError(null)
+}, [designSelection?.selector])
+
+// When we enter Design mode (or the preview reloads), ping the bridge and (re)apply inspect toggle state.
+useEffect(() => {
+  if (mode !== 'design') return
+  postToPreview({ kind: 'vorbyte:design', type: 'ping' })
+  postToPreview({ kind: 'vorbyte:design', type: 'enable', enabled: designInspectEnabled })
+}, [mode, previewFrameNonce, previewSrc, designInspectEnabled, postToPreview])
+
+const applyDesignChanges = async () => {
+  if (!activeProject) return
+  if (!designSelection) return
+
+  const req: DesignApplyRequest = {
+    projectPath: activeProject.path,
+    route: previewRoute || '/',
+    selector: designSelection.selector,
+    originalText: designSelection.text,
+    newText: designTextDraft,
+    originalClassName: designSelection.className,
+    newClassName: designClassDraft
+  }
+
+  setDesignApplying(true)
+  setDesignApplyError(null)
+  try {
+    const res: DesignApplyResult = await window.api.design.apply(req)
+    if (!res?.ok) throw new Error(res?.message || 'Failed to apply design changes')
+
+    // Update preview DOM immediately as a UX nicety; Next HMR will reconcile after file write.
+    postToPreview({
+      kind: 'vorbyte:design',
+      type: 'apply',
+      selector: designSelection.selector,
+      newText: designTextDraft,
+      newClassName: designClassDraft
+    })
+
+    // Fallback reload: some changes can require a refresh.
+    setPreviewFrameNonce((n) => n + 1)
+  } catch (err) {
+    setDesignApplyError(err instanceof Error ? err.message : String(err))
+  } finally {
+    setDesignApplying(false)
+  }
+}
+
 
   return (
     <div className="h-full bg-white text-zinc-900">
@@ -684,7 +992,7 @@ export default function App() {
                     {activeProject.name}
                   </div>
                 </div>
-                <button className="rounded border px-2 py-1 text-xs hover:bg-zinc-50" onClick={() => setActiveProject(null)}>
+                <button className="rounded border px-2 py-1 text-xs hover:bg-zinc-50" onClick={closeProject}>
                   Back
                 </button>
               </div>
@@ -692,7 +1000,18 @@ export default function App() {
               <div className="mt-3">
                 <div className="mb-1 text-xs font-semibold text-zinc-700">Files</div>
                 <div className="max-h-[70vh] overflow-auto rounded border p-2">
-                  <TreeView root={tree} />
+                  <TreeView
+              root={tree}
+              onOpenFile={(filePath) => {
+                const route = guessRouteFromFilePath(filePath)
+                if (route) {
+                  setPreviewRoute(route)
+                  setMode('design')
+                  setPreviewFrameNonce((n) => n + 1)
+                  void startPreview(false)
+                }
+              }}
+            />
                 </div>
               </div>
             </div>
@@ -737,9 +1056,197 @@ export default function App() {
               )}
             </div>
           ) : mode === 'design' ? (
-            <div className="p-6">
-              <div className="rounded border bg-zinc-50 p-4 text-sm text-zinc-700">
-                Preview will appear here (Milestone 3).
+            <div className="flex h-[calc(100vh-56px)] flex-col">
+              <div className="flex items-center gap-2 border-b border-zinc-200 bg-white px-4 py-2">
+                <div className="text-xs font-medium text-zinc-700">Live Preview</div>
+                <div className="ml-2 flex items-center gap-2 text-[11px] text-zinc-500">
+                  <span className="rounded bg-zinc-100 px-2 py-0.5">{previewStatus?.state ?? 'stopped'}</span>
+                  {previewStatus?.port ? <span>:{previewStatus.port}</span> : null}
+                </div>
+
+                <div className="ml-auto flex items-center gap-2">
+                  <input
+                    value={previewRoute}
+                    onChange={(e) => setPreviewRoute(e.target.value)}
+                    className="w-48 rounded border border-zinc-200 bg-white px-2 py-1 text-xs"
+                    placeholder="/"
+                  />
+                  <button
+                    className="rounded border border-zinc-200 bg-white px-2 py-1 text-xs hover:bg-zinc-50 disabled:opacity-50"
+                    onClick={() => setPreviewFrameNonce((n) => n + 1)}
+                    disabled={!previewSrc}
+                    title="Reload iframe"
+                  >
+                    Reload
+                  </button>
+                  <button
+                    className="rounded border border-zinc-200 bg-white px-2 py-1 text-xs hover:bg-zinc-50 disabled:opacity-50"
+                    onClick={() => startPreview(true)}
+                    disabled={previewStarting || !activeProject}
+                    title="Restart preview server"
+                  >
+                    {previewStarting ? 'Starting…' : 'Restart'}
+                  </button>
+<button
+  className={`rounded border px-2 py-1 text-sm ${
+    designInspectEnabled ? 'bg-blue-600 text-white' : 'bg-white'
+  }`}
+  onClick={() => {
+    const next = !designInspectEnabled
+    setDesignInspectEnabled(next)
+    postToPreview({ kind: 'vorbyte:design', type: 'enable', enabled: next })
+    if (!next) setDesignSelection(null)
+  }}
+  disabled={!activeProject || !previewSrc}
+  title="Toggle element selection in the preview"
+>
+  {designInspectEnabled ? 'Inspect: ON' : 'Inspect'}
+</button>
+
+{!designBridgeReady && activeProject ? (
+  <span className="text-xs text-zinc-500" title="Design bridge not detected yet">
+    (bridge not detected)
+  </span>
+) : null}
+                  <button
+                    className="rounded border border-zinc-200 bg-white px-2 py-1 text-xs hover:bg-zinc-50 disabled:opacity-50"
+                    onClick={() => stopPreview()}
+                    disabled={!activeProject}
+                    title="Stop preview server"
+                  >
+                    Stop
+                  </button>
+                </div>
+              </div>
+
+              <div className="flex flex-1 flex-col gap-2 p-3">
+                <div className="relative flex-1 overflow-hidden rounded border border-zinc-200 bg-white">
+                  {!previewSrc ? (
+                    <div className="flex h-full items-center justify-center p-6 text-sm text-zinc-600">
+                      {previewStatus?.state === 'error' ? (
+                        <div className="max-w-2xl">
+                          <div className="font-medium text-red-600">Preview error</div>
+                          <div className="mt-2 text-xs text-zinc-700">{previewStatus.error}</div>
+                          <div className="mt-3 text-[11px] text-zinc-500">Open “Preview logs” below for details.</div>
+                        </div>
+                      ) : (
+                        <div className="max-w-2xl">
+                          <div className="font-medium">Starting preview…</div>
+                          <div className="mt-2 text-xs text-zinc-600">
+                            VorByte will run <code className="rounded bg-zinc-100 px-1 py-0.5">next dev</code> in your project folder.
+                            If this is the first run, it may install dependencies first.
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  ) : (
+                    <iframe
+                      ref={previewIframeRef}
+                      key={previewFrameNonce}
+                      src={previewSrc}
+                      className="h-full w-full"
+                      title="VorByte Live Preview"
+                      onLoad={() => {
+                        setDesignBridgeReady(false)
+                        postToPreview({ kind: 'vorbyte:design', type: 'ping' })
+                        postToPreview({
+                          kind: 'vorbyte:design',
+                          type: 'enable',
+                          enabled: designInspectEnabled
+                        })
+                      }}
+                    />
+                  )}
+<div className="pointer-events-auto absolute right-2 top-2 z-50 w-80 max-h-[calc(100%-16px)] overflow-auto rounded border border-zinc-200 bg-white p-3 shadow">
+  <div className="flex items-center justify-between">
+    <div className="text-sm font-semibold">Properties</div>
+    <button
+      className="rounded border px-2 py-1 text-xs"
+      onClick={() => setDesignSelection(null)}
+      disabled={!designSelection}
+    >
+      Clear
+    </button>
+  </div>
+
+  {!designBridgeReady ? (
+    <div className="mt-3 rounded border bg-zinc-50 p-2 text-xs text-zinc-600">
+      Design bridge not detected yet. If this project was created before Milestone 4,
+      recreate it (or copy the template-kit bridge file into the project).
+    </div>
+  ) : !designSelection ? (
+    <div className="mt-3 text-sm text-zinc-600">
+      {designInspectEnabled
+        ? 'Click an element in the preview to select it.'
+        : 'Enable Inspect (top bar), then click an element in the preview.'}
+    </div>
+  ) : (
+    <div className="mt-3 space-y-3">
+      <div className="text-xs text-zinc-500">
+        Selected: <span className="font-mono">{designSelection.tag}</span>
+      </div>
+
+      <div className="space-y-1">
+        <label className="text-xs font-medium text-zinc-700">Text</label>
+        <textarea
+          className="h-20 w-full resize-none rounded border px-2 py-1 text-sm"
+          value={designTextDraft}
+          onChange={(e) => setDesignTextDraft(e.target.value)}
+          placeholder="(no text)"
+        />
+      </div>
+
+      <div className="space-y-1">
+        <label className="text-xs font-medium text-zinc-700">className</label>
+        <textarea
+          className="h-24 w-full resize-none rounded border px-2 py-1 font-mono text-xs"
+          value={designClassDraft}
+          onChange={(e) => setDesignClassDraft(e.target.value)}
+          placeholder="(no className)"
+        />
+        <div className="text-xs text-zinc-500">
+          Tip: These are Tailwind classes. Keep it space-separated.
+        </div>
+      </div>
+
+      {designApplyError ? (
+        <div className="rounded border border-red-200 bg-red-50 p-2 text-xs text-red-700">
+          {designApplyError}
+        </div>
+      ) : null}
+
+      <div className="flex items-center gap-2">
+        <button
+          className="rounded bg-blue-600 px-3 py-1 text-sm text-white disabled:opacity-50"
+          onClick={applyDesignChanges}
+          disabled={designApplying}
+        >
+          {designApplying ? 'Applying…' : 'Apply'}
+        </button>
+
+        <button
+          className="rounded border px-2 py-1 text-sm"
+          onClick={() => setDesignSelection(null)}
+          disabled={designApplying}
+        >
+          Deselect
+        </button>
+      </div>
+
+      <div className="text-xs text-zinc-500">
+        Best-effort v1: if the change can’t be located in source, switch to Chat mode
+        and ask the AI to apply the same edit.
+      </div>
+    </div>
+  )}
+</div>
+
+                </div>
+
+                <details className="rounded border border-zinc-200 bg-white">
+                  <summary className="cursor-pointer select-none px-3 py-2 text-xs text-zinc-700">Preview logs</summary>
+                  <pre className="max-h-56 overflow-auto p-3 text-[11px] leading-snug text-zinc-800">{previewLogs.join('\n')}</pre>
+                </details>
               </div>
             </div>
           ) : (
