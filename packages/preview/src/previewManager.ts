@@ -223,13 +223,29 @@ function toStatus(inst: Instance): PreviewStatus {
 
 async function killProcessTree(proc: ChildProcessWithoutNullStreams) {
   if (proc.killed) return;
+
+  const pid = proc.pid;
+
+  // Best-effort: if the child was spawned as a detached process (or it spawned a new
+  // process group), try to terminate its process group first (POSIX only).
+  const killGroup = (signal: NodeJS.Signals): boolean => {
+    if (!pid) return false;
+    if (process.platform === "win32") return false;
+    try {
+      process.kill(-pid, signal);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
   try {
-    proc.kill("SIGTERM");
+    if (!killGroup("SIGTERM")) proc.kill("SIGTERM");
   } catch {}
   await new Promise((r) => setTimeout(r, 1600));
   if (!proc.killed) {
     try {
-      proc.kill("SIGKILL");
+      if (!killGroup("SIGKILL")) proc.kill("SIGKILL");
     } catch {}
   }
 }
@@ -587,9 +603,12 @@ class PreviewManagerImpl implements PreviewManager {
     }
 
     if (inst.proc && !inst.proc.killed) {
-      await killProcessTree(inst.proc);
+      const prev = inst.proc;
+      // Clear first so any late "exit" events from the previous process can't
+      // clobber the current instance state.
       inst.proc = undefined;
       inst.pid = undefined;
+      await killProcessTree(prev);
     }
 
     inst.port = await findFreePort(host, opts.port ?? inst.port ?? 3000);
@@ -659,19 +678,47 @@ class PreviewManagerImpl implements PreviewManager {
       proc.stdout.on("data", (d: Buffer) => pushLogChunk(inst!, d));
       proc.stderr.on("data", (d: Buffer) => pushLogChunk(inst!, d));
 
+            const currentProc = proc;
+
       proc.once("error", (err) => {
+        // Ignore late events from an older process that has already been replaced.
+        if (inst!.proc !== currentProc) return;
         inst!.exited = true;
+        inst!.proc = undefined;
+        inst!.pid = undefined;
         inst!.state = "error";
         inst!.error = err.message;
         pushLogLine(inst!, `✖ ${err.message}`);
       });
 
       proc.once("exit", (code, signal) => {
+        // Ignore late events from an older process that has already been replaced.
+        if (inst!.proc !== currentProc) return;
         inst!.exited = true;
-        inst!.state = "error";
+        inst!.proc = undefined;
+        inst!.pid = undefined;
+
+        // If we haven't reached "running" yet, this is an early exit.
+        if (inst!.state === "starting") {
+          const tail = inst!.logs.slice(-120).join("\n");
+          inst!.state = "error";
+          inst!.error = `Preview server exited before it became ready (code=${code ?? "n/a"} signal=${signal ?? "n/a"}).\n\nLast logs:\n${tail}`;
+          pushLogLine(inst!, "✖ Preview server exited before it became ready.");
+          return;
+        }
+
+        // If it was running, treat a clean/expected exit as "stopped".
+        if (code === 0 || signal === "SIGTERM" || signal === "SIGINT") {
+          inst!.state = "stopped";
+          inst!.error = undefined;
+          pushLogLine(inst!, "■ Preview server exited.");
+          return;
+        }
+
         const tail = inst!.logs.slice(-120).join("\n");
-        inst!.error = `Preview server exited early (code=${code ?? "n/a"} signal=${signal ?? "n/a"}).\n\nLast logs:\n${tail}`;
-        pushLogLine(inst!, `✖ Preview server exited early.`);
+        inst!.state = "error";
+        inst!.error = `Preview server crashed (code=${code ?? "n/a"} signal=${signal ?? "n/a"}).\n\nLast logs:\n${tail}`;
+        pushLogLine(inst!, "✖ Preview server crashed.");
       });
     } catch (e: any) {
       inst.state = "error";
@@ -699,10 +746,13 @@ class PreviewManagerImpl implements PreviewManager {
     const inst = this.instances.get(key);
     if (!inst) return false;
 
-    if (inst.proc && !inst.proc.killed) {
-      await killProcessTree(inst.proc);
-      inst.proc = undefined;
-      inst.pid = undefined;
+    const proc = inst.proc;
+    // Clear first so any late "exit" events can't mutate state after we've decided to stop.
+    inst.proc = undefined;
+    inst.pid = undefined;
+
+    if (proc && !proc.killed) {
+      await killProcessTree(proc);
     }
 
     inst.state = "stopped";
@@ -710,6 +760,7 @@ class PreviewManagerImpl implements PreviewManager {
     pushLogLine(inst, "■ Preview stopped");
     return true;
   }
+
 
   async stopAll(): Promise<void> {
     for (const key of [...this.instances.keys()]) {
@@ -722,3 +773,4 @@ class PreviewManagerImpl implements PreviewManager {
 export function createPreviewManager(): PreviewManager {
   return new PreviewManagerImpl();
 }
+

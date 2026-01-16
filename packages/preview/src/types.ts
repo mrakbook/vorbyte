@@ -39,3 +39,4 @@ export interface PreviewManager {
   logs(projectPath: string, opts?: PreviewLogsOptions): string[]
   stopAll(): Promise<void>
 }
+
